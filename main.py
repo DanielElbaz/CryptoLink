@@ -38,6 +38,10 @@ except FileNotFoundError:
 # In-memory storage (no database yet)
 SUSPECTS = {}   # suspect_id -> {"name": str}
 CATALOG = {}    # file_id -> {..., "suspect_id": str, "dataframe": DataFrame}
+# lower(address) -> original-case address, manually marked as noise (e.g. a known exchange
+# hot wallet touched by unrelated users) and excluded from address-based cross-referencing
+# (Wallets/Transfers/Graph). Individual transactions through it still show in Amounts.
+EXCLUDED_ADDRESSES = {}
 
 # ---------------------------------------------------------------------------
 # DETECTION
@@ -433,7 +437,8 @@ def get_all_transactions(suspect_ids=None):
 
 def compute_addresses_analysis(suspect_ids=None):
     """Dominant wallets + addresses shared across different suspect/exchange combos."""
-    rows = [r for r in get_all_transactions(suspect_ids) if r["external_address"]]
+    rows = [r for r in get_all_transactions(suspect_ids)
+            if r["external_address"] and r["external_address"].lower() not in EXCLUDED_ADDRESSES]
 
     # Group case-insensitively (ETH checksummed vs lowercase should still match),
     # but keep the first-seen original casing for display.
@@ -468,9 +473,39 @@ def compute_addresses_analysis(suspect_ids=None):
     return results
 
 
+def _parse_suspect_ids():
+    """Reads the optional ?suspects=id1,id2 query param shared by every analysis/export
+    route, so the same suspect-filter selection drives both the on-screen tabs and exports."""
+    suspects_param = request.args.get("suspects", "").strip()
+    return set(suspects_param.split(",")) if suspects_param else None
+
+
 @app.route("/analysis/addresses")
 def analysis_addresses():
-    return jsonify(compute_addresses_analysis())
+    return jsonify(compute_addresses_analysis(_parse_suspect_ids()))
+
+
+@app.route("/addresses/excluded", methods=["GET"])
+def list_excluded_addresses():
+    return jsonify(sorted(EXCLUDED_ADDRESSES.values(), key=str.lower))
+
+
+@app.route("/addresses/exclude", methods=["POST"])
+def exclude_address():
+    data = request.get_json()
+    addr = (data.get("address") or "").strip()
+    if not addr:
+        return jsonify({"error": "Address required"}), 400
+    EXCLUDED_ADDRESSES[addr.lower()] = addr
+    return jsonify({"success": True})
+
+
+@app.route("/addresses/include", methods=["POST"])
+def include_address():
+    data = request.get_json()
+    addr = (data.get("address") or "").strip().lower()
+    EXCLUDED_ADDRESSES.pop(addr, None)
+    return jsonify({"success": True})
 
 
 def compute_amounts_analysis(suspect_ids=None):
@@ -494,7 +529,7 @@ def compute_amounts_analysis(suspect_ids=None):
 
 @app.route("/analysis/amounts")
 def analysis_amounts():
-    return jsonify(compute_amounts_analysis())
+    return jsonify(compute_amounts_analysis(_parse_suspect_ids()))
 
 
 def _transfer_side(o):
@@ -583,10 +618,11 @@ def compute_transfers_analysis(suspect_ids=None):
             if not claimed[wi] and not claimed[di]:
                 emit(wi, di, "txid")
 
-    # Pass 2: shared external address (only rows the txid pass didn't already claim).
+    # Pass 2: shared external address (only rows the txid pass didn't already claim; manually
+    # excluded/noise addresses never participate in address-based matching).
     by_address = {}
     for i, r in enumerate(rows):
-        if not claimed[i] and r["external_address"]:
+        if not claimed[i] and r["external_address"] and r["external_address"].lower() not in EXCLUDED_ADDRESSES:
             by_address.setdefault(r["external_address"].lower(), []).append(i)
     for idxs in by_address.values():
         withdrawals = [i for i in idxs if rows[i]["file_type"] == "withdrawal"]
@@ -614,7 +650,7 @@ def compute_transfers_analysis(suspect_ids=None):
 
 @app.route("/analysis/transfers")
 def analysis_transfers():
-    return jsonify(compute_transfers_analysis())
+    return jsonify(compute_transfers_analysis(_parse_suspect_ids()))
 
 
 def _fmt_amount_export(amount, currency):
@@ -983,8 +1019,7 @@ def export_pdf(suspect_ids=None):
 
 @app.route("/export/<fmt>")
 def export_report(fmt):
-    suspects_param = request.args.get("suspects", "").strip()
-    suspect_ids = set(suspects_param.split(",")) if suspects_param else None
+    suspect_ids = _parse_suspect_ids()
 
     try:
         if fmt == "xlsx":
@@ -1087,7 +1122,7 @@ def compute_graph_data(suspect_ids=None):
 
 @app.route("/analysis/graph")
 def analysis_graph():
-    return jsonify(compute_graph_data())
+    return jsonify(compute_graph_data(_parse_suspect_ids()))
 
 
 @app.route("/delete/<file_id>", methods=["DELETE"])
@@ -1731,39 +1766,42 @@ function truncMono(value, keepStart, keepEnd) {
 }
 
 function loadAddresses(container) {
-    fetch("/analysis/addresses").then(r => r.json()).then(data => {
-        if (!data.length) {
-            container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>';
-            return;
-        }
-        let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences.</div>`;
-        html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
-        data.forEach((item, idx) => {
-            html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
-                <td><span class="addr-mono">${escapeHtml(item.address)}</span></td>
-                <td>${item.occurrence_count}</td>
-                <td>${item.distinct_accounts}</td>
-                <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
-            </tr>
-            <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
-                <td colspan="4">
-                    <div class="addr-detail-wrap">
-                        <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
-                        ${item.occurrences.map(o => `<tr>
-                            <td>${escapeHtml(o.suspect_name)}</td>
-                            <td>${escapeHtml(o.exchange)}</td>
-                            <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
-                            <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
-                            <td>${fmtDate(o.date)}</td>
-                            <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
-                        </tr>`).join("")}
-                        </tbody></table>
-                    </div>
-                </td>
-            </tr>`;
+    fetch("/analysis/addresses" + suspectsQueryParam()).then(r => r.json()).then(data => {
+        renderHiddenWalletsPanel().then(hiddenHtml => {
+            if (!data.length) {
+                container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>' + hiddenHtml;
+                return;
+            }
+            let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences. Wallets that aren't relevant to your case can be hidden - they'll be excluded from Wallets, Transfers and the Graph.</div>`;
+            html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th><th></th></tr></thead><tbody>';
+            data.forEach((item, idx) => {
+                html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
+                    <td><span class="addr-mono">${escapeHtml(item.address)}</span></td>
+                    <td>${item.occurrence_count}</td>
+                    <td>${item.distinct_accounts}</td>
+                    <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
+                    <td><button class="btn small danger" onclick="event.stopPropagation(); hideWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Hide</button></td>
+                </tr>
+                <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
+                    <td colspan="5">
+                        <div class="addr-detail-wrap">
+                            <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                            ${item.occurrences.map(o => `<tr>
+                                <td>${escapeHtml(o.suspect_name)}</td>
+                                <td>${escapeHtml(o.exchange)}</td>
+                                <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
+                                <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
+                                <td>${fmtDate(o.date)}</td>
+                                <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
+                            </tr>`).join("")}
+                            </tbody></table>
+                        </div>
+                    </td>
+                </tr>`;
+            });
+            html += "</tbody></table></div>";
+            container.innerHTML = html + hiddenHtml;
         });
-        html += "</tbody></table></div>";
-        container.innerHTML = html;
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
@@ -1774,8 +1812,36 @@ function toggleAddrDetail(idx) {
     row.style.display = row.style.display === "none" ? "table-row" : "none";
 }
 
+function renderHiddenWalletsPanel() {
+    return fetch("/addresses/excluded").then(r => r.json()).then(list => {
+        if (!list.length) return "";
+        return `<div class="panel-title" style="margin-top:24px;">Hidden wallets (${list.length})</div>
+            <div class="table-wrap"><table><thead><tr><th>Address</th><th></th></tr></thead><tbody>
+            ${list.map(addr => `<tr>
+                <td><span class="addr-mono">${escapeHtml(addr)}</span></td>
+                <td><button class="btn small" onclick="restoreWallet('${escapeHtml(addr).replace(/'/g, "\\'")}')">Restore</button></td>
+            </tr>`).join("")}
+            </tbody></table></div>`;
+    }).catch(() => "");
+}
+
+function hideWallet(address) {
+    if (!confirm(`Hide wallet ${address} from Wallets, Transfers and the Graph?\n\nIndividual transactions through it will still show in Amounts. You can restore it anytime.`)) return;
+    fetch("/addresses/exclude", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address })
+    }).then(() => loadAnalysisTab(currentAnalysisTab));
+}
+
+function restoreWallet(address) {
+    fetch("/addresses/include", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address })
+    }).then(() => loadAnalysisTab(currentAnalysisTab));
+}
+
 function loadAmounts(container) {
-    fetch("/analysis/amounts").then(r => r.json()).then(data => {
+    fetch("/analysis/amounts" + suspectsQueryParam()).then(r => r.json()).then(data => {
         if (!data.length) {
             container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
             return;
@@ -1801,7 +1867,7 @@ function loadAmounts(container) {
 }
 
 function loadTransfers(container) {
-    fetch("/analysis/transfers").then(r => r.json()).then(data => {
+    fetch("/analysis/transfers" + suspectsQueryParam()).then(r => r.json()).then(data => {
         const matched = data.matched || [];
         const unmatched = data.unmatched || [];
         if (!matched.length && !unmatched.length) {
@@ -1887,7 +1953,7 @@ let graphNetworkInstance = null;
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown.</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Click a wallet node to hide it (won't affect suspect nodes).</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
@@ -1898,7 +1964,7 @@ function loadGraph(container) {
         <div id="graphCanvas"></div>
     `;
 
-    fetch("/analysis/graph").then(r => r.json()).then(data => {
+    fetch("/analysis/graph" + suspectsQueryParam()).then(r => r.json()).then(data => {
         if (!data.nodes.length) {
             document.getElementById("graphCanvas").outerHTML =
                 '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
@@ -1929,6 +1995,12 @@ function loadGraph(container) {
 
         if (graphNetworkInstance) graphNetworkInstance.destroy();
         graphNetworkInstance = new vis.Network(document.getElementById("graphCanvas"), { nodes, edges }, options);
+        graphNetworkInstance.on("click", params => {
+            if (!params.nodes.length) return;
+            const node = nodes.get(params.nodes[0]);
+            if (!node.group || !node.group.startsWith("address_shared")) return; // only wallet nodes can be hidden, not suspects
+            hideWallet(node.title);
+        });
     }).catch(err => {
         document.getElementById("graphCanvas").outerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
     });
@@ -1978,12 +2050,28 @@ function renderSuspectFilterList() {
 function onSuspectFilterChange(id, checked) {
     if (checked) suspectFilterSelected.add(id);
     else suspectFilterSelected.delete(id);
+    refreshCurrentAnalysisTab();
 }
 
 function setAllSuspectFilter(selectAll) {
     const ids = Object.keys(suspects);
     suspectFilterSelected = selectAll ? new Set(ids) : new Set();
     renderSuspectFilterList();
+    refreshCurrentAnalysisTab();
+}
+
+function refreshCurrentAnalysisTab() {
+    if (currentMainTab === "analysis") loadAnalysisTab(currentAnalysisTab);
+}
+
+// Builds the ?suspects=id1,id2 query string shared by every analysis fetch and by export,
+// so the same suspect-filter selection drives both the on-screen tabs and exports. Empty
+// string when nothing is filtered out (i.e. show/export everything).
+function suspectsQueryParam() {
+    const allIds = Object.keys(suspects);
+    const selected = Array.from(suspectFilterSelected);
+    const isFiltered = selected.length > 0 && selected.length < allIds.length;
+    return isFiltered ? `?suspects=${selected.join(",")}` : "";
 }
 
 function triggerExport(fmt) {
@@ -1995,10 +2083,7 @@ function triggerExport(fmt) {
         return;
     }
 
-    // omit the query param entirely when everything is selected (cleanest default export)
-    const isFiltered = selected.length > 0 && selected.length < allIds.length;
-    const url = isFiltered ? `/export/${fmt}?suspects=${selected.join(",")}` : `/export/${fmt}`;
-    window.location.href = url;
+    window.location.href = `/export/${fmt}${suspectsQueryParam()}`;
 }
 
 
