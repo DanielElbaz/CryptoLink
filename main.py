@@ -429,11 +429,17 @@ def compute_addresses_analysis(suspect_ids=None):
     results = []
     for addr_lower, occurrences in by_address.items():
         distinct_combos = {(o["suspect_id"], o["exchange"]) for o in occurrences}
+        distinct_suspects = {o["suspect_id"] for o in occurrences}
         results.append({
             "address": occurrences[0]["external_address"],
             "occurrence_count": len(occurrences),
             "distinct_accounts": len(distinct_combos),
             "is_cross_account": len(distinct_combos) > 1,
+            # Distinguishes "same person, multiple exchanges" (cross_account but not
+            # cross_suspect) from "different people" (cross_suspect) - the two are very
+            # different findings and were previously conflated into one flag.
+            "distinct_suspect_count": len(distinct_suspects),
+            "is_cross_suspect": len(distinct_suspects) > 1,
             "occurrences": [{
                 "suspect_id": o["suspect_id"], "suspect_name": o["suspect_name"], "exchange": o["exchange"],
                 "file_type": o["file_type"], "amount": o["amount"], "amount_usd": o["amount_usd"],
@@ -476,44 +482,98 @@ def analysis_amounts():
     return jsonify(compute_amounts_analysis())
 
 
+def _transfer_side(o):
+    return {
+        "suspect_id": o["suspect_id"], "suspect_name": o["suspect_name"], "exchange": o["exchange"],
+        "amount": o["amount"], "amount_usd": o["amount_usd"], "currency": o["currency"],
+        "date": o["date"].isoformat(), "txid": o["txid"],
+    }
+
+
+def _pair_score(w, d):
+    """Ranks a candidate (withdrawal, deposit) match sharing the same external address.
+    Lower is better. Same-currency pairs whose amounts are close (tier 0) always outrank
+    pairs with mismatched/unknown currency or amount (tier 1, only compared by time gap) -
+    this is what lets the 1-to-1 matching below pick the single most plausible deposit for
+    each withdrawal instead of pairing every withdrawal with every later deposit."""
+    gap_hours = (d["date"] - w["date"]).total_seconds() / 3600
+    same_currency = (
+        w["currency"] is not None and d["currency"] is not None
+        and w["currency"].strip().upper() == d["currency"].strip().upper()
+    )
+    rel_diff = None
+    if same_currency and w["amount"] and d["amount"]:
+        rel_diff = abs(w["amount"] - d["amount"]) / max(abs(w["amount"]), abs(d["amount"]), 1e-9)
+    tier = 0 if rel_diff is not None else 1
+    return (tier, rel_diff if rel_diff is not None else 0.0, gap_hours)
+
+
 def compute_transfers_analysis(suspect_ids=None):
-    """Withdrawal on exchange A -> deposit on exchange B via the same external address,
-    deposit occurring after the withdrawal. Sorted by time gap, closest first. Nothing excluded."""
+    """Matches withdrawals to deposits that share the same external address, deposit
+    occurring after the withdrawal - i.e. money leaving one wallet and later re-appearing
+    from the same wallet elsewhere (same exchange or a different one; same person's own
+    accounts, or two different people).
+
+    Each withdrawal is matched to AT MOST ONE deposit (and vice versa): for every address,
+    all valid (withdrawal, deposit) candidates are scored by currency/amount closeness then
+    time gap, and greedily paired off best-match-first. This avoids the earlier all-with-all
+    behaviour, which turned e.g. 3 withdrawals + 4 deposits on one address into up to 12
+    "transfers" - wildly overcounting a handful of real movements.
+
+    Returns {"matched": [...], "unmatched": [...]}. Unmatched entries are withdrawals/deposits
+    that reused a shared address but couldn't be confidently paired with anything (e.g. a
+    withdrawal with no later deposit from that address yet) - still worth a human's attention,
+    listed separately rather than silently dropped or force-matched.
+    """
     rows = [r for r in get_all_transactions(suspect_ids) if r["external_address"] and r["date"] is not None]
 
     by_address = {}
     for r in rows:
         by_address.setdefault(r["external_address"].lower(), []).append(r)
 
-    pairs = []
+    matched, unmatched = [], []
     for addr_lower, occurrences in by_address.items():
         addr = occurrences[0]["external_address"]
         withdrawals = [o for o in occurrences if o["file_type"] == "withdrawal"]
         deposits = [o for o in occurrences if o["file_type"] == "deposit"]
-        for w in withdrawals:
-            for d in deposits:
-                if d["exchange"] == w["exchange"]:
-                    continue  # same exchange - not a cross-exchange transfer
+
+        candidates = []
+        for wi, w in enumerate(withdrawals):
+            for di, d in enumerate(deposits):
                 if d["date"] < w["date"]:
                     continue  # deposit happened before the withdrawal - not this direction
-                gap_hours = (d["date"] - w["date"]).total_seconds() / 3600
-                pairs.append({
-                    "address": addr,
-                    "withdrawal": {
-                        "suspect_name": w["suspect_name"], "exchange": w["exchange"],
-                        "amount": w["amount"], "amount_usd": w["amount_usd"], "currency": w["currency"],
-                        "date": w["date"].isoformat(), "txid": w["txid"],
-                    },
-                    "deposit": {
-                        "suspect_name": d["suspect_name"], "exchange": d["exchange"],
-                        "amount": d["amount"], "amount_usd": d["amount_usd"], "currency": d["currency"],
-                        "date": d["date"].isoformat(), "txid": d["txid"],
-                    },
-                    "gap_hours": round(gap_hours, 2),
-                })
+                candidates.append((_pair_score(w, d), wi, di))
+        candidates.sort(key=lambda c: c[0])
 
-    pairs.sort(key=lambda p: p["gap_hours"])
-    return pairs
+        matched_w_idx, matched_d_idx = set(), set()
+        for score, wi, di in candidates:
+            if wi in matched_w_idx or di in matched_d_idx:
+                continue  # withdrawal or deposit already claimed by a better-scoring match
+            matched_w_idx.add(wi)
+            matched_d_idx.add(di)
+            w, d = withdrawals[wi], deposits[di]
+            tier, rel_diff, gap_hours = score
+            matched.append({
+                "address": addr,
+                "withdrawal": _transfer_side(w),
+                "deposit": _transfer_side(d),
+                "gap_hours": round(gap_hours, 2),
+                "same_suspect": w["suspect_id"] == d["suspect_id"],
+                "same_exchange": w["exchange"] == d["exchange"],
+                "amount_matched": tier == 0,
+                "amount_diff_pct": round(rel_diff * 100, 2) if tier == 0 else None,
+            })
+
+        for wi, w in enumerate(withdrawals):
+            if wi not in matched_w_idx:
+                unmatched.append({"address": addr, "direction": "withdrawal", **_transfer_side(w)})
+        for di, d in enumerate(deposits):
+            if di not in matched_d_idx:
+                unmatched.append({"address": addr, "direction": "deposit", **_transfer_side(d)})
+
+    matched.sort(key=lambda p: p["gap_hours"])
+    unmatched.sort(key=lambda u: u["date"], reverse=True)
+    return {"matched": matched, "unmatched": unmatched}
 
 
 @app.route("/analysis/transfers")
@@ -579,13 +639,13 @@ def export_xlsx(suspect_ids=None):
     # --- Wallets sheet (one row per occurrence, address repeated) ---
     ws = wb.active
     ws.title = "Wallets"
-    write_header(ws, ["Address", "Total Occurrences", "Distinct Accounts", "Shared Across Accounts",
+    write_header(ws, ["Address", "Total Occurrences", "Distinct Accounts", "Different People",
                        "Suspect", "Exchange", "Type", "Amount", "Currency", "Amount USD", "Date", "TXID"])
     for item in ctx["addresses"]:
         for o in item["occurrences"]:
             ws.append([
                 item["address"], item["occurrence_count"], item["distinct_accounts"],
-                "YES" if item["is_cross_account"] else "",
+                "YES" if item["is_cross_suspect"] else "",
                 o["suspect_name"], o["exchange"], o["file_type"],
                 o["amount"], o["currency"], o["amount_usd"], _fmt_date_export(o["date"]), o["txid"],
             ])
@@ -600,17 +660,27 @@ def export_xlsx(suspect_ids=None):
             r["amount_usd"], _fmt_date_export(r["date"]), r["external_address"], r["txid"],
         ])
 
-    # --- Transfers sheet ---
-    ws3 = wb.create_sheet("Cross-exchange transfers")
-    write_header(ws3, ["Address", "Different Suspects", "Gap (hours)",
+    # --- Transfers sheet (one confirmed withdrawal <-> deposit match per row) ---
+    ws3 = wb.create_sheet("Transfers")
+    write_header(ws3, ["Address", "Same Person", "Same Exchange", "Amount Match", "Gap (hours)",
                         "Withdrawal Suspect", "Withdrawal Exchange", "Withdrawal Amount", "Withdrawal Date", "Withdrawal TXID",
                         "Deposit Suspect", "Deposit Exchange", "Deposit Amount", "Deposit Date", "Deposit TXID"])
-    for p in ctx["transfers"]:
+    for p in ctx["transfers"]["matched"]:
         w, d = p["withdrawal"], p["deposit"]
         ws3.append([
-            p["address"], "YES" if w["suspect_name"] != d["suspect_name"] else "", p["gap_hours"],
+            p["address"], "YES" if p["same_suspect"] else "NO", "YES" if p["same_exchange"] else "NO",
+            "YES" if p["amount_matched"] else "unverified", p["gap_hours"],
             w["suspect_name"], w["exchange"], w["amount"], _fmt_date_export(w["date"]), w["txid"],
             d["suspect_name"], d["exchange"], d["amount"], _fmt_date_export(d["date"]), d["txid"],
+        ])
+
+    # --- Unmatched movements sheet (shared address, no confident counterpart found) ---
+    ws4 = wb.create_sheet("Unmatched movements")
+    write_header(ws4, ["Address", "Direction", "Suspect", "Exchange", "Amount", "Currency", "Date", "TXID"])
+    for u in ctx["transfers"]["unmatched"]:
+        ws4.append([
+            u["address"], u["direction"], u["suspect_name"], u["exchange"],
+            u["amount"], u["currency"], _fmt_date_export(u["date"]), u["txid"],
         ])
 
     for ws_ in wb.worksheets:
@@ -646,10 +716,14 @@ def export_docx(suspect_ids=None):
         run.bold = True
         run.font.name = "Consolas"
         p.add_run(f"  —  {item['occurrence_count']} occurrence(s), {item['distinct_accounts']} distinct account(s)")
-        if item["is_cross_account"]:
-            warn = p.add_run("  [SHARED ACROSS ACCOUNTS]")
+        if item["is_cross_suspect"]:
+            warn = p.add_run("  [SHARED BETWEEN DIFFERENT PEOPLE]")
             warn.bold = True
             warn.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
+        elif item["is_cross_account"]:
+            warn = p.add_run("  [SAME PERSON - MULTIPLE EXCHANGES]")
+            warn.bold = True
+            warn.font.color.rgb = RGBColor(0x1F, 0x5C, 0xA8)
 
         table = doc.add_table(rows=1, cols=6)
         table.style = "Light Grid Accent 1"
@@ -685,30 +759,63 @@ def export_docx(suspect_ids=None):
         row[6].text = r["txid"] or "-"
 
     # --- Transfers ---
-    doc.add_heading("Cross-exchange transfers", level=1)
-    doc.add_paragraph(f"{len(ctx['transfers'])} possible transfer(s), sorted by time gap (closest first).")
-    for p in ctx["transfers"]:
+    matched, unmatched = ctx["transfers"]["matched"], ctx["transfers"]["unmatched"]
+    doc.add_heading("Transfers", level=1)
+    doc.add_paragraph(
+        f"{len(matched)} confirmed transfer(s) - each withdrawal matched to its single most "
+        f"likely deposit (closest amount/currency, then closest time), sorted by time gap."
+    )
+    for p in matched:
         w, d = p["withdrawal"], p["deposit"]
-        diff = w["suspect_name"] != d["suspect_name"]
         para = doc.add_paragraph()
         para.add_run(f"Address: ").bold = True
         run = para.add_run(p["address"])
         run.font.name = "Consolas"
-        if diff:
-            warn = para.add_run("  [DIFFERENT SUSPECTS]")
+        if not p["same_suspect"]:
+            warn = para.add_run("  [DIFFERENT PEOPLE]")
             warn.bold = True
             warn.font.color.rgb = RGBColor(0xC0, 0x80, 0x00)
+        else:
+            note = para.add_run("  [SAME PERSON]")
+            note.bold = True
+            note.font.color.rgb = RGBColor(0x1F, 0x5C, 0xA8)
+        if not p["same_exchange"]:
+            para.add_run("  (cross-exchange)")
+        if not p["amount_matched"]:
+            warn2 = para.add_run("  [amount unverified - review manually]")
+            warn2.italic = True
+            warn2.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
 
         table = doc.add_table(rows=3, cols=2)
         table.style = "Light Grid Accent 1"
-        table.rows[0].cells[0].text = "Withdrawal"
-        table.rows[0].cells[1].text = "Deposit"
+        table.rows[0].cells[0].text = "Withdrawal (sent)"
+        table.rows[0].cells[1].text = "Deposit (received)"
         table.rows[1].cells[0].text = f"{w['exchange']} — {w['suspect_name']}\n{_fmt_amount_export(w['amount'], w['currency'])}\n{_fmt_date_export(w['date'])}"
         table.rows[1].cells[1].text = f"{d['exchange']} — {d['suspect_name']}\n{_fmt_amount_export(d['amount'], d['currency'])}\n{_fmt_date_export(d['date'])}"
         table.rows[2].cells[0].text = f"TXID: {w['txid'] or '-'}"
         table.rows[2].cells[1].text = f"TXID: {d['txid'] or '-'}"
         doc.add_paragraph(f"Time gap: {p['gap_hours']} hour(s)")
         doc.add_paragraph()
+
+    if unmatched:
+        doc.add_heading("Unmatched movements (needs manual review)", level=1)
+        doc.add_paragraph(
+            f"{len(unmatched)} withdrawal(s)/deposit(s) reused a shared address but couldn't be "
+            f"confidently paired with a counterpart."
+        )
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        for i, h in enumerate(["Direction", "Suspect", "Exchange", "Amount", "Date", "Address"]):
+            hdr[i].text = h
+        for u in unmatched:
+            row = table.add_row().cells
+            row[0].text = u["direction"]
+            row[1].text = u["suspect_name"]
+            row[2].text = u["exchange"]
+            row[3].text = _fmt_amount_export(u["amount"], u["currency"])
+            row[4].text = _fmt_date_export(u["date"])
+            row[5].text = u["address"]
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -756,7 +863,7 @@ def export_pdf(suspect_ids=None):
         for o in item["occurrences"]:
             wallet_rows.append([
                 item["address"][:40], str(item["occurrence_count"]),
-                "YES" if item["is_cross_account"] else "",
+                "DIFF. PEOPLE" if item["is_cross_suspect"] else ("same person" if item["is_cross_account"] else ""),
                 o["suspect_name"], o["exchange"], o["file_type"],
                 _fmt_amount_export(o["amount"], o["currency"]), _fmt_date_export(o["date"]), (o["txid"] or "-")[:24],
             ])
@@ -784,22 +891,48 @@ def export_pdf(suspect_ids=None):
     elements.append(Spacer(1, 16))
 
     # --- Transfers ---
-    elements.append(Paragraph("Cross-exchange transfers", styles["Heading1"]))
-    elements.append(Paragraph(f"{len(ctx['transfers'])} possible transfer(s), sorted by time gap.", styles["Normal"]))
+    matched, unmatched = ctx["transfers"]["matched"], ctx["transfers"]["unmatched"]
+    elements.append(Paragraph("Transfers", styles["Heading1"]))
+    elements.append(Paragraph(
+        f"{len(matched)} confirmed transfer(s) - each withdrawal matched to its single most likely "
+        f"deposit (closest amount/currency, then closest time), sorted by time gap.", styles["Normal"]))
     elements.append(Spacer(1, 6))
     transfer_rows = []
-    for p in ctx["transfers"]:
+    for p in matched:
         w, d = p["withdrawal"], p["deposit"]
+        flags = []
+        flags.append("DIFF. PEOPLE" if not p["same_suspect"] else "same person")
+        if not p["same_exchange"]:
+            flags.append("cross-exch.")
+        if not p["amount_matched"]:
+            flags.append("unverified amt")
         transfer_rows.append([
-            p["address"][:30], "YES" if w["suspect_name"] != d["suspect_name"] else "", str(p["gap_hours"]),
+            p["address"][:30], " / ".join(flags), str(p["gap_hours"]),
             f"{w['exchange']}/{w['suspect_name']}", _fmt_amount_export(w["amount"], w["currency"]), _fmt_date_export(w["date"]),
             f"{d['exchange']}/{d['suspect_name']}", _fmt_amount_export(d["amount"], d["currency"]), _fmt_date_export(d["date"]),
         ])
     if transfer_rows:
         elements.append(add_table(
-            ["Address", "Diff. suspects", "Gap (h)", "Withdrawal from", "W. Amount", "W. Date",
+            ["Address", "Flags", "Gap (h)", "Withdrawal from", "W. Amount", "W. Date",
              "Deposit to", "D. Amount", "D. Date"],
             transfer_rows
+        ))
+    elements.append(Spacer(1, 16))
+
+    # --- Unmatched movements ---
+    if unmatched:
+        elements.append(Paragraph("Unmatched movements (needs manual review)", styles["Heading1"]))
+        elements.append(Paragraph(
+            f"{len(unmatched)} withdrawal(s)/deposit(s) reused a shared address but couldn't be "
+            f"confidently paired with a counterpart.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+        unmatched_rows = [[
+            u["direction"], u["suspect_name"], u["exchange"],
+            _fmt_amount_export(u["amount"], u["currency"]), _fmt_date_export(u["date"]), u["address"][:30],
+        ] for u in unmatched]
+        elements.append(add_table(
+            ["Direction", "Suspect", "Exchange", "Amount", "Date", "Address"],
+            unmatched_rows
         ))
 
     doc.build(elements)
@@ -853,7 +986,10 @@ def compute_graph_data(suspect_ids=None):
             "id": addr_id,
             "label": item["address"][:6] + "…" + item["address"][-4:] if len(item["address"]) > 12 else item["address"],
             "title": item["address"],
-            "group": "address_shared",
+            # Red for a wallet shared between different people, amber when it's the same
+            # person reusing a wallet across their own exchange accounts - visually distinct
+            # findings, not the same alert level.
+            "group": "address_shared_cross_suspect" if item["is_cross_suspect"] else "address_shared_same_suspect",
         }
 
         by_suspect = {}
@@ -912,7 +1048,7 @@ HTML_PAGE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CryptoLink - Exchange File Import</title>
-<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script src="/static/vis-network.min.js"></script>
 <style>
     :root {
         --bg: #0f1420; --bg-card: #171d2e; --border: #2a3348;
@@ -1055,6 +1191,14 @@ HTML_PAGE = """
         display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
         font-weight: 700; background: rgba(245,166,35,0.18); color: var(--warning);
     }
+    .same-person-badge {
+        display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
+        font-weight: 700; background: rgba(79,140,255,0.18); color: var(--accent); margin-left: 8px;
+    }
+    .unverified-badge {
+        display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
+        font-weight: 700; background: rgba(245,166,35,0.18); color: var(--warning); margin-left: 8px;
+    }
 
     .addr-row { cursor: pointer; }
     .addr-detail-row td { background: #10141f; padding: 0; }
@@ -1169,7 +1313,7 @@ HTML_PAGE = """
         <div class="sub-tabs">
             <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
             <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
-            <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Cross-exchange transfers</button>
+            <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
             <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
         </div>
         <div id="analysisContent"></div>
@@ -1540,7 +1684,7 @@ function loadAddresses(container) {
                 <td><span class="addr-mono">${escapeHtml(item.address)}</span></td>
                 <td>${item.occurrence_count}</td>
                 <td>${item.distinct_accounts}</td>
-                <td>${item.is_cross_account ? '<span class="cross-badge">SHARED ACROSS ACCOUNTS</span>' : ""}</td>
+                <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
             </tr>
             <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
                 <td colspan="4">
@@ -1599,37 +1743,75 @@ function loadAmounts(container) {
 
 function loadTransfers(container) {
     fetch("/analysis/transfers").then(r => r.json()).then(data => {
-        if (!data.length) {
-            container.innerHTML = '<div class="analysis-empty">No cross-exchange transfers detected yet.</div>';
+        const matched = data.matched || [];
+        const unmatched = data.unmatched || [];
+        if (!matched.length && !unmatched.length) {
+            container.innerHTML = '<div class="analysis-empty">No wallet-to-wallet transfers detected yet.</div>';
             return;
         }
-        let html = `<div class="results-note">${data.length} possible transfer(s) between exchanges via the same address, sorted by time gap (closest first).</div>`;
-        data.forEach(p => {
-            const diffSuspect = p.withdrawal.suspect_name !== p.deposit.suspect_name;
+
+        const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
+        const samePersonCount = matched.length - diffPeopleCount;
+
+        let html = `<div class="results-note">
+            ${matched.length} confirmed transfer(s) — each withdrawal matched to the single most likely deposit
+            (closest amount/currency, then closest time). <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
+            <b>${diffPeopleCount}</b> between <b>two different people</b>.
+            ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
+        </div>`;
+
+        matched.forEach(p => {
+            const w = p.withdrawal, d = p.deposit;
+            const who = p.same_suspect
+                ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
+                : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
             html += `<div class="transfer-card">
-                <div class="addr-line">Address: <span class="addr-mono">${escapeHtml(p.address)}</span> ${diffSuspect ? '<span class="diff-suspect-badge">DIFFERENT SUSPECTS</span>' : ""}</div>
+                <div class="addr-line">
+                    ${who} — via <span class="addr-mono">${escapeHtml(p.address)}</span>
+                    ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
+                    ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
+                    ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
+                </div>
                 <div class="transfer-flow">
                     <div class="transfer-side">
-                        <div class="label">Withdrawal</div>
-                        <div class="exchange-name">${escapeHtml(p.withdrawal.exchange)}</div>
-                        <div>${escapeHtml(p.withdrawal.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(p.withdrawal.amount, p.withdrawal.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(p.withdrawal.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(p.withdrawal.txid || "-")}</span></div>
+                        <div class="label">Sent (withdrawal)</div>
+                        <div class="exchange-name">${escapeHtml(w.exchange)}</div>
+                        <div>${escapeHtml(w.suspect_name)}</div>
+                        <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
+                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
+                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(w.txid || "-")}</span></div>
                     </div>
                     <div class="transfer-arrow">→</div>
                     <div class="transfer-side">
-                        <div class="label">Deposit</div>
-                        <div class="exchange-name">${escapeHtml(p.deposit.exchange)}</div>
-                        <div>${escapeHtml(p.deposit.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(p.deposit.amount, p.deposit.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(p.deposit.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(p.deposit.txid || "-")}</span></div>
+                        <div class="label">Received (deposit)</div>
+                        <div class="exchange-name">${escapeHtml(d.exchange)}</div>
+                        <div>${escapeHtml(d.suspect_name)}</div>
+                        <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
+                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
+                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(d.txid || "-")}</span></div>
                     </div>
                 </div>
                 <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
             </div>`;
         });
+
+        if (unmatched.length) {
+            html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
+            html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+            unmatched.forEach(u => {
+                html += `<tr>
+                    <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
+                    <td>${escapeHtml(u.suspect_name)}</td>
+                    <td>${escapeHtml(u.exchange)}</td>
+                    <td>${fmtAmount(u.amount, u.currency)}</td>
+                    <td>${fmtDate(u.date)}</td>
+                    <td>${truncMono(u.address)}</td>
+                    <td>${truncMono(u.txid)}</td>
+                </tr>`;
+            });
+            html += "</tbody></table></div>";
+        }
+
         container.innerHTML = html;
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
@@ -1644,7 +1826,8 @@ function loadGraph(container) {
             <div class="results-note" style="margin-bottom:0;">Only wallets connecting two different accounts are shown - a different suspect, or the same suspect on two exchanges.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
-                <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Shared wallet</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</span>
             </div>
         </div>
         <div id="graphCanvas"></div>
@@ -1672,7 +1855,8 @@ function loadGraph(container) {
             },
             groups: {
                 suspect: { color: { background: "#4f8cff", border: "#2a4a8a" }, shape: "dot", size: 22 },
-                address_shared: { color: { background: "#f0556b", border: "#8a2030" } },
+                address_shared_cross_suspect: { color: { background: "#f0556b", border: "#8a2030" } },
+                address_shared_same_suspect: { color: { background: "#f5a623", border: "#8a5c10" } },
             },
             physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
             interaction: { hover: true, tooltipDelay: 100 },
