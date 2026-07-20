@@ -487,7 +487,24 @@ def analysis_addresses():
 
 @app.route("/addresses/excluded", methods=["GET"])
 def list_excluded_addresses():
-    return jsonify(sorted(EXCLUDED_ADDRESSES.values(), key=str.lower))
+    """Hidden wallets with enough context to decide whether to restore one without having
+    to go re-check the Wallets tab - just the raw address isn't enough to remember why it
+    mattered."""
+    rows = [r for r in get_all_transactions() if r["external_address"]]
+    by_address = {}
+    for r in rows:
+        by_address.setdefault(r["external_address"].lower(), []).append(r)
+
+    result = []
+    for addr_lower, original in EXCLUDED_ADDRESSES.items():
+        occurrences = by_address.get(addr_lower, [])
+        result.append({
+            "address": original,
+            "occurrence_count": len(occurrences),
+            "suspect_names": sorted({o["suspect_name"] for o in occurrences}),
+        })
+    result.sort(key=lambda x: x["address"].lower())
+    return jsonify(result)
 
 
 @app.route("/addresses/exclude", methods=["POST"])
@@ -1171,6 +1188,10 @@ HTML_PAGE = """
     }
     select:focus, input[type="text"]:focus { outline: none; border-color: var(--accent); }
     #activeSuspectSelect { min-width: 220px; }
+    .search-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+    #analysisSearch { width: 100%; max-width: 420px; font-family: "SF Mono", Consolas, monospace; }
+    .search-match-note { font-size: 12px; color: var(--text-dim); margin-left: 2px; }
+    mark.search-hit { background: rgba(245,166,35,0.35); color: inherit; border-radius: 2px; padding: 0 1px; }
 
     .btn {
         background: var(--accent-dim); color: var(--text); border: none;
@@ -1347,6 +1368,37 @@ HTML_PAGE = """
         width: 100%; height: 560px; background: var(--bg-card); border: 1px solid var(--border);
         border-radius: var(--radius);
     }
+    .graph-canvas-wrap { position: relative; }
+    .node-toolbar {
+        position: absolute; display: none; gap: 4px; background: var(--bg-card);
+        border: 1px solid var(--border); border-radius: 6px; padding: 4px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.35); z-index: 10;
+    }
+
+    .analysis-layout { display: flex; gap: 20px; align-items: flex-start; }
+    .analysis-main { flex: 1; min-width: 0; }
+    .hidden-wallets-sidebar {
+        flex: 0 0 260px; background: var(--bg-card); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 14px; position: sticky; top: 20px;
+    }
+    .hidden-wallets-sidebar h3 { font-size: 12.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; margin: 0 0 10px; }
+    .hidden-wallet-item { border-bottom: 1px solid var(--border); padding: 10px 0; }
+    .hidden-wallet-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .hidden-wallet-addr { display: flex; align-items: center; gap: 6px; }
+    .hidden-wallet-meta { font-size: 11.5px; color: var(--text-dim); margin: 4px 0 8px; }
+    @media (max-width: 900px) {
+        .analysis-layout { flex-direction: column; }
+        .hidden-wallets-sidebar { flex: none; width: 100%; position: static; }
+    }
+
+    .row-actions { display: inline-flex; gap: 2px; margin-left: 8px; opacity: 0; transition: opacity 0.12s ease; vertical-align: middle; }
+    tr:hover .row-actions, .hidden-wallet-item:hover .row-actions, .hidden-wallet-addr:hover .row-actions { opacity: 1; }
+    .icon-btn {
+        background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 13px;
+        padding: 3px 5px; border-radius: 4px; line-height: 1;
+    }
+    .icon-btn:hover { color: var(--text); background: #1c2438; }
+    .icon-btn.danger:hover { color: var(--danger); background: rgba(240,85,107,0.12); }
 </style>
 </head>
 <body>
@@ -1404,13 +1456,22 @@ HTML_PAGE = """
                 <div id="suspectFilterList" class="suspect-filter-list"></div>
             </div>
         </div>
-        <div class="sub-tabs">
-            <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
-            <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
-            <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
-            <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
+        <div class="analysis-layout">
+            <div class="analysis-main">
+                <div class="search-row">
+                    <input type="text" id="analysisSearch" placeholder="Search by wallet address or TXID..." oninput="onAnalysisSearch(this.value)">
+                    <button class="btn small" id="analysisSearchClear" onclick="clearAnalysisSearch()" style="display:none;">Clear</button>
+                </div>
+                <div class="sub-tabs">
+                    <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
+                    <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
+                    <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
+                    <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
+                </div>
+                <div id="analysisContent"></div>
+            </div>
+            <aside id="hiddenWalletsSidebar" class="hidden-wallets-sidebar" style="display:none;"></aside>
         </div>
-        <div id="analysisContent"></div>
     </div>
 </div>
 
@@ -1719,7 +1780,7 @@ function switchMainTab(tab) {
     document.getElementById("analysisView").style.display = tab === "analysis" ? "block" : "none";
     document.getElementById("tabBtnFiles").classList.toggle("active", tab === "files");
     document.getElementById("tabBtnAnalysis").classList.toggle("active", tab === "analysis");
-    if (tab === "analysis") loadAnalysisTab(currentAnalysisTab);
+    if (tab === "analysis") { loadAnalysisTab(currentAnalysisTab); refreshHiddenWalletsSidebar(); }
 }
 
 function switchAnalysisTab(tab) {
@@ -1758,6 +1819,11 @@ function truncMono(value, keepStart, keepEnd) {
     keepEnd = keepEnd || 6;
     if (!value) return `<span class="addr-mono">-</span>`;
     const v = String(value);
+    // Show the full value (highlighted) instead of truncating when it's what matched the
+    // active search - truncation would otherwise hide the very match the user searched for.
+    if (analysisSearchQuery && matchesSearch(v)) {
+        return `<span class="addr-mono">${highlightMatch(v)}</span>`;
+    }
     if (v.length <= keepStart + keepEnd + 3) {
         return `<span class="addr-mono">${escapeHtml(v)}</span>`;
     }
@@ -1767,44 +1833,56 @@ function truncMono(value, keepStart, keepEnd) {
 
 function loadAddresses(container) {
     fetch("/analysis/addresses" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        renderHiddenWalletsPanel().then(hiddenHtml => {
-            if (!data.length) {
-                container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>' + hiddenHtml;
-                return;
-            }
-            let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences. Wallets that aren't relevant to your case can be hidden - they'll be excluded from Wallets, Transfers and the Graph.</div>`;
-            html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th><th></th></tr></thead><tbody>';
-            data.forEach((item, idx) => {
-                html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
-                    <td><span class="addr-mono">${escapeHtml(item.address)}</span></td>
-                    <td>${item.occurrence_count}</td>
-                    <td>${item.distinct_accounts}</td>
-                    <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
-                    <td><button class="btn small danger" onclick="event.stopPropagation(); hideWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Hide</button></td>
-                </tr>
-                <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
-                    <td colspan="5">
-                        <div class="addr-detail-wrap">
-                            <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
-                            ${item.occurrences.map(o => `<tr>
-                                <td>${escapeHtml(o.suspect_name)}</td>
-                                <td>${escapeHtml(o.exchange)}</td>
-                                <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
-                                <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
-                                <td>${fmtDate(o.date)}</td>
-                                <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
-                            </tr>`).join("")}
-                            </tbody></table>
-                        </div>
-                    </td>
-                </tr>`;
-            });
-            html += "</tbody></table></div>";
-            container.innerHTML = html + hiddenHtml;
-        });
+        cachedAddresses = data;
+        renderAddresses(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function renderAddresses(container) {
+    const data = cachedAddresses || [];
+    if (!data.length) {
+        container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>';
+        return;
+    }
+    // An address matches if its own text matches, or any of its occurrences' TXID does -
+    // the search field covers both wallet addresses and TXIDs per the same box.
+    const filtered = data.filter(item =>
+        matchesSearch(item.address) || item.occurrences.some(o => matchesSearch(o.txid))
+    );
+    if (!filtered.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+    let html = `<div class="results-note">${filtered.length} of ${data.length} distinct address(es) shown, sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
+    html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
+    filtered.forEach((item, idx) => {
+        html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
+            <td>${addressCellHtml(item.address)}</td>
+            <td>${item.occurrence_count}</td>
+            <td>${item.distinct_accounts}</td>
+            <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
+        </tr>
+        <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${analysisSearchQuery ? 'table-row' : 'none'};">
+            <td colspan="4">
+                <div class="addr-detail-wrap">
+                    <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                    ${item.occurrences.map(o => `<tr>
+                        <td>${escapeHtml(o.suspect_name)}</td>
+                        <td>${escapeHtml(o.exchange)}</td>
+                        <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
+                        <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
+                        <td>${fmtDate(o.date)}</td>
+                        <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
+                    </tr>`).join("")}
+                    </tbody></table>
+                </div>
+            </td>
+        </tr>`;
+    });
+    html += "</tbody></table></div>";
+    container.innerHTML = html;
 }
 
 function toggleAddrDetail(idx) {
@@ -1812,148 +1890,240 @@ function toggleAddrDetail(idx) {
     row.style.display = row.style.display === "none" ? "table-row" : "none";
 }
 
-function renderHiddenWalletsPanel() {
-    return fetch("/addresses/excluded").then(r => r.json()).then(list => {
-        if (!list.length) return "";
-        return `<div class="panel-title" style="margin-top:24px;">Hidden wallets (${list.length})</div>
-            <div class="table-wrap"><table><thead><tr><th>Address</th><th></th></tr></thead><tbody>
-            ${list.map(addr => `<tr>
-                <td><span class="addr-mono">${escapeHtml(addr)}</span></td>
-                <td><button class="btn small" onclick="restoreWallet('${escapeHtml(addr).replace(/'/g, "\\'")}')">Restore</button></td>
-            </tr>`).join("")}
-            </tbody></table></div>`;
-    }).catch(() => "");
+// Address cell with copy/hide icons that only appear on hover (see .row-actions CSS).
+// Used anywhere a wallet address is listed. Pass includeHide=false where the wallet is
+// already hidden (the sidebar) - a "hide" action there would be redundant with Restore.
+function addressCellHtml(address, includeHide) {
+    if (includeHide === undefined) includeHide = true;
+    const esc = escapeHtml(address).replace(/'/g, "\\'");
+    return `<span class="addr-mono">${highlightMatch(address)}</span>
+        <span class="row-actions">
+            <button class="icon-btn" title="Copy address" onclick="event.stopPropagation(); copyAddress('${esc}')">📋</button>
+            ${includeHide ? `<button class="icon-btn danger" title="Hide this wallet" onclick="event.stopPropagation(); hideWallet('${esc}')">🗑️</button>` : ""}
+        </span>`;
+}
+
+// Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
+// highlighting/focusing a matching node instead of filtering a list).
+let analysisSearchQuery = "";
+let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null;
+
+function matchesSearch(text) {
+    if (!analysisSearchQuery) return true;
+    return (text || "").toLowerCase().includes(analysisSearchQuery);
+}
+
+function highlightMatch(text) {
+    const safe = escapeHtml(text == null ? "" : String(text));
+    if (!analysisSearchQuery) return safe;
+    const idx = safe.toLowerCase().indexOf(escapeHtml(analysisSearchQuery).toLowerCase());
+    if (idx === -1) return safe;
+    return safe.slice(0, idx) + '<mark class="search-hit">' + safe.slice(idx, idx + analysisSearchQuery.length) + "</mark>" + safe.slice(idx + analysisSearchQuery.length);
+}
+
+function onAnalysisSearch(value) {
+    analysisSearchQuery = value.trim().toLowerCase();
+    document.getElementById("analysisSearchClear").style.display = analysisSearchQuery ? "inline-block" : "none";
+    reapplyAnalysisSearch();
+}
+
+function clearAnalysisSearch() {
+    document.getElementById("analysisSearch").value = "";
+    onAnalysisSearch("");
+}
+
+// Re-renders the current tab from already-fetched data (no network round-trip per
+// keystroke). Falls back to a full load if nothing's cached yet for that tab.
+function reapplyAnalysisSearch() {
+    const container = document.getElementById("analysisContent");
+    if (currentAnalysisTab === "addresses") { if (cachedAddresses) renderAddresses(container); else loadAddresses(container); }
+    else if (currentAnalysisTab === "amounts") { if (cachedAmounts) renderAmounts(container); else loadAmounts(container); }
+    else if (currentAnalysisTab === "transfers") { if (cachedTransfers) renderTransfers(container); else loadTransfers(container); }
+    else if (currentAnalysisTab === "graph") focusGraphSearchMatch();
+}
+
+function copyAddress(address) {
+    navigator.clipboard.writeText(address).then(
+        () => showToast("Address copied", false),
+        () => showToast("Couldn't copy address", true)
+    );
 }
 
 function hideWallet(address) {
-    if (!confirm(`Hide wallet ${address} from Wallets, Transfers and the Graph?\n\nIndividual transactions through it will still show in Amounts. You can restore it anytime.`)) return;
     fetch("/addresses/exclude", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address })
-    }).then(() => loadAnalysisTab(currentAnalysisTab));
+    }).then(() => {
+        showToast("Wallet hidden - restore it anytime from the sidebar", false);
+        loadAnalysisTab(currentAnalysisTab);
+        refreshHiddenWalletsSidebar();
+    });
 }
 
 function restoreWallet(address) {
     fetch("/addresses/include", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address })
-    }).then(() => loadAnalysisTab(currentAnalysisTab));
+    }).then(() => {
+        loadAnalysisTab(currentAnalysisTab);
+        refreshHiddenWalletsSidebar();
+    });
+}
+
+function refreshHiddenWalletsSidebar() {
+    const sidebar = document.getElementById("hiddenWalletsSidebar");
+    fetch("/addresses/excluded").then(r => r.json()).then(list => {
+        if (!list.length) { sidebar.style.display = "none"; sidebar.innerHTML = ""; return; }
+        sidebar.style.display = "block";
+        sidebar.innerHTML = `<h3>Hidden wallets (${list.length})</h3>` + list.map(item => `
+            <div class="hidden-wallet-item">
+                <div class="hidden-wallet-addr">${addressCellHtml(item.address, false)}</div>
+                <div class="hidden-wallet-meta">${item.occurrence_count} occurrence(s)${item.suspect_names.length ? " · " + escapeHtml(item.suspect_names.join(", ")) : ""}</div>
+                <button class="btn small" onclick="restoreWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Restore</button>
+            </div>
+        `).join("");
+    }).catch(() => {});
 }
 
 function loadAmounts(container) {
     fetch("/analysis/amounts" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        if (!data.length) {
-            container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
-            return;
-        }
-        let html = `<div class="results-note">${data.length} transaction(s), sorted largest to smallest (USD-equivalent first when available).</div>`;
-        html += '<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
-        data.forEach(r => {
-            html += `<tr>
-                <td>${escapeHtml(r.suspect_name)}</td>
-                <td>${escapeHtml(r.exchange)}</td>
-                <td><span class="badge ${r.file_type}">${TYPE_LABELS[r.file_type] || r.file_type}</span></td>
-                <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
-                <td>${fmtDate(r.date)}</td>
-                <td>${truncMono(r.external_address)}</td>
-                <td>${truncMono(r.txid)}</td>
-            </tr>`;
-        });
-        html += "</tbody></table></div>";
-        container.innerHTML = html;
+        cachedAmounts = data;
+        renderAmounts(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function renderAmounts(container) {
+    const data = cachedAmounts || [];
+    if (!data.length) {
+        container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
+        return;
+    }
+    const filtered = data.filter(r => matchesSearch(r.external_address) || matchesSearch(r.txid));
+    if (!filtered.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+    let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, sorted largest to smallest (USD-equivalent first when available).</div>`;
+    html += '<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+    filtered.forEach(r => {
+        html += `<tr>
+            <td>${escapeHtml(r.suspect_name)}</td>
+            <td>${escapeHtml(r.exchange)}</td>
+            <td><span class="badge ${r.file_type}">${TYPE_LABELS[r.file_type] || r.file_type}</span></td>
+            <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
+            <td>${fmtDate(r.date)}</td>
+            <td>${truncMono(r.external_address)}</td>
+            <td>${truncMono(r.txid)}</td>
+        </tr>`;
+    });
+    html += "</tbody></table></div>";
+    container.innerHTML = html;
 }
 
 function loadTransfers(container) {
     fetch("/analysis/transfers" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        const matched = data.matched || [];
-        const unmatched = data.unmatched || [];
-        if (!matched.length && !unmatched.length) {
-            container.innerHTML = '<div class="analysis-empty">No wallet-to-wallet transfers detected yet.</div>';
-            return;
-        }
-
-        const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
-        const samePersonCount = matched.length - diffPeopleCount;
-        const txidCount = matched.filter(p => p.match_type === "txid").length;
-
-        let html = `<div class="results-note">
-            ${matched.length} confirmed transfer(s) — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
-            ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
-            <b>${diffPeopleCount}</b> between <b>two different people</b>.
-            ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
-        </div>`;
-
-        matched.forEach(p => {
-            const w = p.withdrawal, d = p.deposit;
-            const who = p.same_suspect
-                ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
-                : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
-            const viaLabel = p.match_type === "txid"
-                ? `matching TX hash <span class="addr-mono">${escapeHtml(w.txid)}</span>`
-                : `shared address <span class="addr-mono">${escapeHtml(p.address)}</span>`;
-            html += `<div class="transfer-card">
-                <div class="addr-line">
-                    ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
-                    ${who} — via ${viaLabel}
-                    ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
-                    ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
-                    ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
-                </div>
-                <div class="transfer-flow">
-                    <div class="transfer-side">
-                        <div class="label">Sent (withdrawal)</div>
-                        <div class="exchange-name">${escapeHtml(w.exchange)}</div>
-                        <div>${escapeHtml(w.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(w.txid || "-")}</span></div>
-                    </div>
-                    <div class="transfer-arrow">→</div>
-                    <div class="transfer-side">
-                        <div class="label">Received (deposit)</div>
-                        <div class="exchange-name">${escapeHtml(d.exchange)}</div>
-                        <div>${escapeHtml(d.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(d.txid || "-")}</span></div>
-                    </div>
-                </div>
-                <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
-            </div>`;
-        });
-
-        if (unmatched.length) {
-            html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
-            html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
-            unmatched.forEach(u => {
-                html += `<tr>
-                    <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
-                    <td>${escapeHtml(u.suspect_name)}</td>
-                    <td>${escapeHtml(u.exchange)}</td>
-                    <td>${fmtAmount(u.amount, u.currency)}</td>
-                    <td>${fmtDate(u.date)}</td>
-                    <td>${truncMono(u.address)}</td>
-                    <td>${truncMono(u.txid)}</td>
-                </tr>`;
-            });
-            html += "</tbody></table></div>";
-        }
-
-        container.innerHTML = html;
+        cachedTransfers = data;
+        renderTransfers(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
 }
 
+function renderTransfers(container) {
+    const allMatched = (cachedTransfers && cachedTransfers.matched) || [];
+    const allUnmatched = (cachedTransfers && cachedTransfers.unmatched) || [];
+    if (!allMatched.length && !allUnmatched.length) {
+        container.innerHTML = '<div class="analysis-empty">No wallet-to-wallet transfers detected yet.</div>';
+        return;
+    }
+
+    const matched = allMatched.filter(p => matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid));
+    const unmatched = allUnmatched.filter(u => matchesSearch(u.address) || matchesSearch(u.txid));
+    if (!matched.length && !unmatched.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+
+    const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
+    const samePersonCount = matched.length - diffPeopleCount;
+    const txidCount = matched.filter(p => p.match_type === "txid").length;
+
+    let html = `<div class="results-note">
+        ${matched.length}${analysisSearchQuery ? ` of ${allMatched.length}` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
+        ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
+        <b>${diffPeopleCount}</b> between <b>two different people</b>.
+        ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
+    </div>`;
+
+    matched.forEach(p => {
+        const w = p.withdrawal, d = p.deposit;
+        const who = p.same_suspect
+            ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
+            : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
+        const viaLabel = p.match_type === "txid"
+            ? `matching TX hash <span class="addr-mono">${highlightMatch(w.txid)}</span>`
+            : `shared address <span class="addr-mono">${highlightMatch(p.address)}</span>`;
+        html += `<div class="transfer-card">
+            <div class="addr-line">
+                ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
+                ${who} — via ${viaLabel}
+                ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
+                ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
+                ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
+            </div>
+            <div class="transfer-flow">
+                <div class="transfer-side">
+                    <div class="label">Sent (withdrawal)</div>
+                    <div class="exchange-name">${escapeHtml(w.exchange)}</div>
+                    <div>${escapeHtml(w.suspect_name)}</div>
+                    <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
+                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
+                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
+                </div>
+                <div class="transfer-arrow">→</div>
+                <div class="transfer-side">
+                    <div class="label">Received (deposit)</div>
+                    <div class="exchange-name">${escapeHtml(d.exchange)}</div>
+                    <div>${escapeHtml(d.suspect_name)}</div>
+                    <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
+                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
+                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
+                </div>
+            </div>
+            <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
+        </div>`;
+    });
+
+    if (unmatched.length) {
+        html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
+        html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+        unmatched.forEach(u => {
+            html += `<tr>
+                <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
+                <td>${escapeHtml(u.suspect_name)}</td>
+                <td>${escapeHtml(u.exchange)}</td>
+                <td>${fmtAmount(u.amount, u.currency)}</td>
+                <td>${fmtDate(u.date)}</td>
+                <td>${truncMono(u.address)}</td>
+                <td>${truncMono(u.txid)}</td>
+            </tr>`;
+        });
+        html += "</tbody></table></div>";
+    }
+
+    container.innerHTML = html;
+}
+
 let graphNetworkInstance = null;
+
+let graphToolbarHideTimer = null;
 
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Click a wallet node to hide it (won't affect suspect nodes).</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Hover a wallet node for actions.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
@@ -1961,11 +2131,22 @@ function loadGraph(container) {
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
         </div>
-        <div id="graphCanvas"></div>
+        <div class="graph-canvas-wrap">
+            <div id="graphCanvas"></div>
+            <div id="graphNodeToolbar" class="node-toolbar">
+                <button class="icon-btn" title="Copy address" onclick="copyAddress(document.getElementById('graphNodeToolbar').dataset.address)">📋</button>
+                <button class="icon-btn danger" title="Hide this wallet" onclick="hideWallet(document.getElementById('graphNodeToolbar').dataset.address)">🗑️</button>
+            </div>
+        </div>
     `;
+
+    const toolbar = document.getElementById("graphNodeToolbar");
+    toolbar.addEventListener("mouseenter", () => clearTimeout(graphToolbarHideTimer));
+    toolbar.addEventListener("mouseleave", scheduleHideGraphToolbar);
 
     fetch("/analysis/graph" + suspectsQueryParam()).then(r => r.json()).then(data => {
         if (!data.nodes.length) {
+            if (graphNetworkInstance) { graphNetworkInstance.destroy(); graphNetworkInstance = null; }
             document.getElementById("graphCanvas").outerHTML =
                 '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
             return;
@@ -2000,15 +2181,58 @@ function loadGraph(container) {
         graphNetworkInstance.once("stabilizationIterationsDone", () => {
             graphNetworkInstance.setOptions({ physics: false });
         });
-        graphNetworkInstance.on("click", params => {
-            if (!params.nodes.length) return;
-            const node = nodes.get(params.nodes[0]);
-            if (!node.group || !node.group.startsWith("address_shared")) return; // only wallet nodes can be hidden, not suspects
-            hideWallet(node.title);
+
+        // Hover a wallet node -> show a small floating copy/hide toolbar next to it (suspect
+        // nodes can't be hidden, so they get no toolbar). A short delay on hide lets the
+        // mouse travel from the node onto the toolbar itself without it disappearing first.
+        graphNetworkInstance.on("hoverNode", params => {
+            const node = nodes.get(params.node);
+            if (!node.group || !node.group.startsWith("address_shared")) return;
+            clearTimeout(graphToolbarHideTimer);
+            const pos = graphNetworkInstance.canvasToDOM(graphNetworkInstance.getPositions([params.node])[params.node]);
+            toolbar.style.left = (pos.x + 16) + "px";
+            toolbar.style.top = (pos.y - 14) + "px";
+            toolbar.style.display = "flex";
+            toolbar.dataset.address = node.title;
         });
+        graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
+        graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
+        graphNetworkInstance.on("zoom", () => { toolbar.style.display = "none"; });
+
+        focusGraphSearchMatch();
     }).catch(err => {
         document.getElementById("graphCanvas").outerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function scheduleHideGraphToolbar() {
+    clearTimeout(graphToolbarHideTimer);
+    graphToolbarHideTimer = setTimeout(() => {
+        const toolbar = document.getElementById("graphNodeToolbar");
+        if (toolbar) toolbar.style.display = "none";
+    }, 250);
+}
+
+// Graph tab has no per-row list to filter, so the shared search box instead selects and
+// centers on the matching wallet node (by address) or, failing that, the matching
+// TXID-confirmed edge - same search box, same query, adapted to a graph instead of a table.
+function focusGraphSearchMatch() {
+    if (!graphNetworkInstance) return;
+    if (!analysisSearchQuery) { graphNetworkInstance.unselectAll(); return; }
+
+    const nodeMatch = graphNetworkInstance.body.data.nodes.get().find(n => matchesSearch(n.title));
+    if (nodeMatch) {
+        graphNetworkInstance.selectNodes([nodeMatch.id]);
+        graphNetworkInstance.focus(nodeMatch.id, { scale: 1.3, animation: true });
+        return;
+    }
+    const edgeMatch = graphNetworkInstance.body.data.edges.get().find(e => matchesSearch(e.title));
+    if (edgeMatch) {
+        graphNetworkInstance.selectEdges([edgeMatch.id]);
+        graphNetworkInstance.focus(edgeMatch.from, { scale: 1.2, animation: true });
+        return;
+    }
+    graphNetworkInstance.unselectAll();
 }
 
 
