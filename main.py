@@ -25,8 +25,15 @@ app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSO
 # below) instead of loaded from a CDN or a separate /static request - this used to pull
 # from unpkg.com at runtime, which silently breaks the whole tab on any offline/restricted
 # network (common for forensic workstations). Vendored file, read once at startup.
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vis-network.min.js"), encoding="utf-8") as _f:
-    VIS_NETWORK_JS = _f.read()
+# Missing file (e.g. main.py was copied without its static/ folder) degrades to a disabled
+# Graph tab instead of crashing the whole app on startup.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vis-network.min.js"), encoding="utf-8") as _f:
+        VIS_NETWORK_JS = _f.read()
+except FileNotFoundError:
+    print("WARNING: static/vis-network.min.js not found - the Graph tab will be disabled. "
+          "Copy the whole project (including the static/ folder) to fix this.")
+    VIS_NETWORK_JS = "console.error('vis-network.min.js missing - copy the static/ folder from the project.');"
 
 # In-memory storage (no database yet)
 SUSPECTS = {}   # suspect_id -> {"name": str}
