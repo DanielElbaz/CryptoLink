@@ -487,7 +487,24 @@ def analysis_addresses():
 
 @app.route("/addresses/excluded", methods=["GET"])
 def list_excluded_addresses():
-    return jsonify(sorted(EXCLUDED_ADDRESSES.values(), key=str.lower))
+    """Hidden wallets with enough context to decide whether to restore one without having
+    to go re-check the Wallets tab - just the raw address isn't enough to remember why it
+    mattered."""
+    rows = [r for r in get_all_transactions() if r["external_address"]]
+    by_address = {}
+    for r in rows:
+        by_address.setdefault(r["external_address"].lower(), []).append(r)
+
+    result = []
+    for addr_lower, original in EXCLUDED_ADDRESSES.items():
+        occurrences = by_address.get(addr_lower, [])
+        result.append({
+            "address": original,
+            "occurrence_count": len(occurrences),
+            "suspect_names": sorted({o["suspect_name"] for o in occurrences}),
+        })
+    result.sort(key=lambda x: x["address"].lower())
+    return jsonify(result)
 
 
 @app.route("/addresses/exclude", methods=["POST"])
@@ -1347,6 +1364,37 @@ HTML_PAGE = """
         width: 100%; height: 560px; background: var(--bg-card); border: 1px solid var(--border);
         border-radius: var(--radius);
     }
+    .graph-canvas-wrap { position: relative; }
+    .node-toolbar {
+        position: absolute; display: none; gap: 4px; background: var(--bg-card);
+        border: 1px solid var(--border); border-radius: 6px; padding: 4px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.35); z-index: 10;
+    }
+
+    .analysis-layout { display: flex; gap: 20px; align-items: flex-start; }
+    .analysis-main { flex: 1; min-width: 0; }
+    .hidden-wallets-sidebar {
+        flex: 0 0 260px; background: var(--bg-card); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 14px; position: sticky; top: 20px;
+    }
+    .hidden-wallets-sidebar h3 { font-size: 12.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; margin: 0 0 10px; }
+    .hidden-wallet-item { border-bottom: 1px solid var(--border); padding: 10px 0; }
+    .hidden-wallet-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .hidden-wallet-addr { display: flex; align-items: center; gap: 6px; }
+    .hidden-wallet-meta { font-size: 11.5px; color: var(--text-dim); margin: 4px 0 8px; }
+    @media (max-width: 900px) {
+        .analysis-layout { flex-direction: column; }
+        .hidden-wallets-sidebar { flex: none; width: 100%; position: static; }
+    }
+
+    .row-actions { display: inline-flex; gap: 2px; margin-left: 8px; opacity: 0; transition: opacity 0.12s ease; vertical-align: middle; }
+    tr:hover .row-actions, .hidden-wallet-item:hover .row-actions, .hidden-wallet-addr:hover .row-actions { opacity: 1; }
+    .icon-btn {
+        background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 13px;
+        padding: 3px 5px; border-radius: 4px; line-height: 1;
+    }
+    .icon-btn:hover { color: var(--text); background: #1c2438; }
+    .icon-btn.danger:hover { color: var(--danger); background: rgba(240,85,107,0.12); }
 </style>
 </head>
 <body>
@@ -1404,13 +1452,18 @@ HTML_PAGE = """
                 <div id="suspectFilterList" class="suspect-filter-list"></div>
             </div>
         </div>
-        <div class="sub-tabs">
-            <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
-            <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
-            <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
-            <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
+        <div class="analysis-layout">
+            <div class="analysis-main">
+                <div class="sub-tabs">
+                    <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
+                    <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
+                    <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
+                    <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
+                </div>
+                <div id="analysisContent"></div>
+            </div>
+            <aside id="hiddenWalletsSidebar" class="hidden-wallets-sidebar" style="display:none;"></aside>
         </div>
-        <div id="analysisContent"></div>
     </div>
 </div>
 
@@ -1719,7 +1772,7 @@ function switchMainTab(tab) {
     document.getElementById("analysisView").style.display = tab === "analysis" ? "block" : "none";
     document.getElementById("tabBtnFiles").classList.toggle("active", tab === "files");
     document.getElementById("tabBtnAnalysis").classList.toggle("active", tab === "analysis");
-    if (tab === "analysis") loadAnalysisTab(currentAnalysisTab);
+    if (tab === "analysis") { loadAnalysisTab(currentAnalysisTab); refreshHiddenWalletsSidebar(); }
 }
 
 function switchAnalysisTab(tab) {
@@ -1767,41 +1820,38 @@ function truncMono(value, keepStart, keepEnd) {
 
 function loadAddresses(container) {
     fetch("/analysis/addresses" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        renderHiddenWalletsPanel().then(hiddenHtml => {
-            if (!data.length) {
-                container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>' + hiddenHtml;
-                return;
-            }
-            let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences. Wallets that aren't relevant to your case can be hidden - they'll be excluded from Wallets, Transfers and the Graph.</div>`;
-            html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th><th></th></tr></thead><tbody>';
-            data.forEach((item, idx) => {
-                html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
-                    <td><span class="addr-mono">${escapeHtml(item.address)}</span></td>
-                    <td>${item.occurrence_count}</td>
-                    <td>${item.distinct_accounts}</td>
-                    <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
-                    <td><button class="btn small danger" onclick="event.stopPropagation(); hideWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Hide</button></td>
-                </tr>
-                <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
-                    <td colspan="5">
-                        <div class="addr-detail-wrap">
-                            <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
-                            ${item.occurrences.map(o => `<tr>
-                                <td>${escapeHtml(o.suspect_name)}</td>
-                                <td>${escapeHtml(o.exchange)}</td>
-                                <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
-                                <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
-                                <td>${fmtDate(o.date)}</td>
-                                <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
-                            </tr>`).join("")}
-                            </tbody></table>
-                        </div>
-                    </td>
-                </tr>`;
-            });
-            html += "</tbody></table></div>";
-            container.innerHTML = html + hiddenHtml;
+        if (!data.length) {
+            container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>';
+            return;
+        }
+        let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
+        html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
+        data.forEach((item, idx) => {
+            html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
+                <td>${addressCellHtml(item.address)}</td>
+                <td>${item.occurrence_count}</td>
+                <td>${item.distinct_accounts}</td>
+                <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
+            </tr>
+            <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
+                <td colspan="4">
+                    <div class="addr-detail-wrap">
+                        <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                        ${item.occurrences.map(o => `<tr>
+                            <td>${escapeHtml(o.suspect_name)}</td>
+                            <td>${escapeHtml(o.exchange)}</td>
+                            <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
+                            <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
+                            <td>${fmtDate(o.date)}</td>
+                            <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
+                        </tr>`).join("")}
+                        </tbody></table>
+                    </div>
+                </td>
+            </tr>`;
         });
+        html += "</tbody></table></div>";
+        container.innerHTML = html;
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
@@ -1812,32 +1862,60 @@ function toggleAddrDetail(idx) {
     row.style.display = row.style.display === "none" ? "table-row" : "none";
 }
 
-function renderHiddenWalletsPanel() {
-    return fetch("/addresses/excluded").then(r => r.json()).then(list => {
-        if (!list.length) return "";
-        return `<div class="panel-title" style="margin-top:24px;">Hidden wallets (${list.length})</div>
-            <div class="table-wrap"><table><thead><tr><th>Address</th><th></th></tr></thead><tbody>
-            ${list.map(addr => `<tr>
-                <td><span class="addr-mono">${escapeHtml(addr)}</span></td>
-                <td><button class="btn small" onclick="restoreWallet('${escapeHtml(addr).replace(/'/g, "\\'")}')">Restore</button></td>
-            </tr>`).join("")}
-            </tbody></table></div>`;
-    }).catch(() => "");
+// Address cell with copy/hide icons that only appear on hover (see .row-actions CSS).
+// Used anywhere a wallet address is listed. Pass includeHide=false where the wallet is
+// already hidden (the sidebar) - a "hide" action there would be redundant with Restore.
+function addressCellHtml(address, includeHide) {
+    if (includeHide === undefined) includeHide = true;
+    const esc = escapeHtml(address).replace(/'/g, "\\'");
+    return `<span class="addr-mono">${escapeHtml(address)}</span>
+        <span class="row-actions">
+            <button class="icon-btn" title="Copy address" onclick="event.stopPropagation(); copyAddress('${esc}')">📋</button>
+            ${includeHide ? `<button class="icon-btn danger" title="Hide this wallet" onclick="event.stopPropagation(); hideWallet('${esc}')">🗑️</button>` : ""}
+        </span>`;
+}
+
+function copyAddress(address) {
+    navigator.clipboard.writeText(address).then(
+        () => showToast("Address copied", false),
+        () => showToast("Couldn't copy address", true)
+    );
 }
 
 function hideWallet(address) {
-    if (!confirm(`Hide wallet ${address} from Wallets, Transfers and the Graph?\n\nIndividual transactions through it will still show in Amounts. You can restore it anytime.`)) return;
     fetch("/addresses/exclude", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address })
-    }).then(() => loadAnalysisTab(currentAnalysisTab));
+    }).then(() => {
+        showToast("Wallet hidden - restore it anytime from the sidebar", false);
+        loadAnalysisTab(currentAnalysisTab);
+        refreshHiddenWalletsSidebar();
+    });
 }
 
 function restoreWallet(address) {
     fetch("/addresses/include", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address })
-    }).then(() => loadAnalysisTab(currentAnalysisTab));
+    }).then(() => {
+        loadAnalysisTab(currentAnalysisTab);
+        refreshHiddenWalletsSidebar();
+    });
+}
+
+function refreshHiddenWalletsSidebar() {
+    const sidebar = document.getElementById("hiddenWalletsSidebar");
+    fetch("/addresses/excluded").then(r => r.json()).then(list => {
+        if (!list.length) { sidebar.style.display = "none"; sidebar.innerHTML = ""; return; }
+        sidebar.style.display = "block";
+        sidebar.innerHTML = `<h3>Hidden wallets (${list.length})</h3>` + list.map(item => `
+            <div class="hidden-wallet-item">
+                <div class="hidden-wallet-addr">${addressCellHtml(item.address, false)}</div>
+                <div class="hidden-wallet-meta">${item.occurrence_count} occurrence(s)${item.suspect_names.length ? " · " + escapeHtml(item.suspect_names.join(", ")) : ""}</div>
+                <button class="btn small" onclick="restoreWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Restore</button>
+            </div>
+        `).join("");
+    }).catch(() => {});
 }
 
 function loadAmounts(container) {
@@ -1950,10 +2028,12 @@ function loadTransfers(container) {
 
 let graphNetworkInstance = null;
 
+let graphToolbarHideTimer = null;
+
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Click a wallet node to hide it (won't affect suspect nodes).</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Hover a wallet node for actions.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
@@ -1961,8 +2041,18 @@ function loadGraph(container) {
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
         </div>
-        <div id="graphCanvas"></div>
+        <div class="graph-canvas-wrap">
+            <div id="graphCanvas"></div>
+            <div id="graphNodeToolbar" class="node-toolbar">
+                <button class="icon-btn" title="Copy address" onclick="copyAddress(document.getElementById('graphNodeToolbar').dataset.address)">📋</button>
+                <button class="icon-btn danger" title="Hide this wallet" onclick="hideWallet(document.getElementById('graphNodeToolbar').dataset.address)">🗑️</button>
+            </div>
+        </div>
     `;
+
+    const toolbar = document.getElementById("graphNodeToolbar");
+    toolbar.addEventListener("mouseenter", () => clearTimeout(graphToolbarHideTimer));
+    toolbar.addEventListener("mouseleave", scheduleHideGraphToolbar);
 
     fetch("/analysis/graph" + suspectsQueryParam()).then(r => r.json()).then(data => {
         if (!data.nodes.length) {
@@ -2000,15 +2090,34 @@ function loadGraph(container) {
         graphNetworkInstance.once("stabilizationIterationsDone", () => {
             graphNetworkInstance.setOptions({ physics: false });
         });
-        graphNetworkInstance.on("click", params => {
-            if (!params.nodes.length) return;
-            const node = nodes.get(params.nodes[0]);
-            if (!node.group || !node.group.startsWith("address_shared")) return; // only wallet nodes can be hidden, not suspects
-            hideWallet(node.title);
+
+        // Hover a wallet node -> show a small floating copy/hide toolbar next to it (suspect
+        // nodes can't be hidden, so they get no toolbar). A short delay on hide lets the
+        // mouse travel from the node onto the toolbar itself without it disappearing first.
+        graphNetworkInstance.on("hoverNode", params => {
+            const node = nodes.get(params.node);
+            if (!node.group || !node.group.startsWith("address_shared")) return;
+            clearTimeout(graphToolbarHideTimer);
+            const pos = graphNetworkInstance.canvasToDOM(graphNetworkInstance.getPositions([params.node])[params.node]);
+            toolbar.style.left = (pos.x + 16) + "px";
+            toolbar.style.top = (pos.y - 14) + "px";
+            toolbar.style.display = "flex";
+            toolbar.dataset.address = node.title;
         });
+        graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
+        graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
+        graphNetworkInstance.on("zoom", () => { toolbar.style.display = "none"; });
     }).catch(err => {
         document.getElementById("graphCanvas").outerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function scheduleHideGraphToolbar() {
+    clearTimeout(graphToolbarHideTimer);
+    graphToolbarHideTimer = setTimeout(() => {
+        const toolbar = document.getElementById("graphNodeToolbar");
+        if (toolbar) toolbar.style.display = "none";
+    }, 250);
 }
 
 
