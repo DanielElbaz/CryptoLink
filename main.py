@@ -1990,11 +1990,16 @@ function loadGraph(container) {
                 address_shared_same_suspect: { color: { background: "#f5a623", border: "#8a5c10" } },
             },
             physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
-            interaction: { hover: true, tooltipDelay: 100 },
+            interaction: { hover: true, tooltipDelay: 100, dragNodes: true },
         };
 
         if (graphNetworkInstance) graphNetworkInstance.destroy();
         graphNetworkInstance = new vis.Network(document.getElementById("graphCanvas"), { nodes, edges }, options);
+        // Physics only runs for the initial layout. Once it settles, turn it off so dragging
+        // one node repositions just that node instead of the whole graph reacting/reshuffling.
+        graphNetworkInstance.once("stabilizationIterationsDone", () => {
+            graphNetworkInstance.setOptions({ physics: false });
+        });
         graphNetworkInstance.on("click", params => {
             if (!params.nodes.length) return;
             const node = nodes.get(params.nodes[0]);
