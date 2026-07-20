@@ -1188,6 +1188,10 @@ HTML_PAGE = """
     }
     select:focus, input[type="text"]:focus { outline: none; border-color: var(--accent); }
     #activeSuspectSelect { min-width: 220px; }
+    .search-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+    #analysisSearch { width: 100%; max-width: 420px; font-family: "SF Mono", Consolas, monospace; }
+    .search-match-note { font-size: 12px; color: var(--text-dim); margin-left: 2px; }
+    mark.search-hit { background: rgba(245,166,35,0.35); color: inherit; border-radius: 2px; padding: 0 1px; }
 
     .btn {
         background: var(--accent-dim); color: var(--text); border: none;
@@ -1454,6 +1458,10 @@ HTML_PAGE = """
         </div>
         <div class="analysis-layout">
             <div class="analysis-main">
+                <div class="search-row">
+                    <input type="text" id="analysisSearch" placeholder="Search by wallet address or TXID..." oninput="onAnalysisSearch(this.value)">
+                    <button class="btn small" id="analysisSearchClear" onclick="clearAnalysisSearch()" style="display:none;">Clear</button>
+                </div>
                 <div class="sub-tabs">
                     <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
                     <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
@@ -1811,6 +1819,11 @@ function truncMono(value, keepStart, keepEnd) {
     keepEnd = keepEnd || 6;
     if (!value) return `<span class="addr-mono">-</span>`;
     const v = String(value);
+    // Show the full value (highlighted) instead of truncating when it's what matched the
+    // active search - truncation would otherwise hide the very match the user searched for.
+    if (analysisSearchQuery && matchesSearch(v)) {
+        return `<span class="addr-mono">${highlightMatch(v)}</span>`;
+    }
     if (v.length <= keepStart + keepEnd + 3) {
         return `<span class="addr-mono">${escapeHtml(v)}</span>`;
     }
@@ -1820,41 +1833,56 @@ function truncMono(value, keepStart, keepEnd) {
 
 function loadAddresses(container) {
     fetch("/analysis/addresses" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        if (!data.length) {
-            container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>';
-            return;
-        }
-        let html = `<div class="results-note">${data.length} distinct address(es), sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
-        html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
-        data.forEach((item, idx) => {
-            html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
-                <td>${addressCellHtml(item.address)}</td>
-                <td>${item.occurrence_count}</td>
-                <td>${item.distinct_accounts}</td>
-                <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
-            </tr>
-            <tr class="addr-detail-row" id="addrDetail${idx}" style="display:none;">
-                <td colspan="4">
-                    <div class="addr-detail-wrap">
-                        <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
-                        ${item.occurrences.map(o => `<tr>
-                            <td>${escapeHtml(o.suspect_name)}</td>
-                            <td>${escapeHtml(o.exchange)}</td>
-                            <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
-                            <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
-                            <td>${fmtDate(o.date)}</td>
-                            <td class="addr-mono">${escapeHtml(o.txid || "-")}</td>
-                        </tr>`).join("")}
-                        </tbody></table>
-                    </div>
-                </td>
-            </tr>`;
-        });
-        html += "</tbody></table></div>";
-        container.innerHTML = html;
+        cachedAddresses = data;
+        renderAddresses(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function renderAddresses(container) {
+    const data = cachedAddresses || [];
+    if (!data.length) {
+        container.innerHTML = '<div class="analysis-empty">No addresses found yet - import some files first.</div>';
+        return;
+    }
+    // An address matches if its own text matches, or any of its occurrences' TXID does -
+    // the search field covers both wallet addresses and TXIDs per the same box.
+    const filtered = data.filter(item =>
+        matchesSearch(item.address) || item.occurrences.some(o => matchesSearch(o.txid))
+    );
+    if (!filtered.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+    let html = `<div class="results-note">${filtered.length} of ${data.length} distinct address(es) shown, sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
+    html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
+    filtered.forEach((item, idx) => {
+        html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
+            <td>${addressCellHtml(item.address)}</td>
+            <td>${item.occurrence_count}</td>
+            <td>${item.distinct_accounts}</td>
+            <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
+        </tr>
+        <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${analysisSearchQuery ? 'table-row' : 'none'};">
+            <td colspan="4">
+                <div class="addr-detail-wrap">
+                    <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                    ${item.occurrences.map(o => `<tr>
+                        <td>${escapeHtml(o.suspect_name)}</td>
+                        <td>${escapeHtml(o.exchange)}</td>
+                        <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
+                        <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
+                        <td>${fmtDate(o.date)}</td>
+                        <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
+                    </tr>`).join("")}
+                    </tbody></table>
+                </div>
+            </td>
+        </tr>`;
+    });
+    html += "</tbody></table></div>";
+    container.innerHTML = html;
 }
 
 function toggleAddrDetail(idx) {
@@ -1868,11 +1896,50 @@ function toggleAddrDetail(idx) {
 function addressCellHtml(address, includeHide) {
     if (includeHide === undefined) includeHide = true;
     const esc = escapeHtml(address).replace(/'/g, "\\'");
-    return `<span class="addr-mono">${escapeHtml(address)}</span>
+    return `<span class="addr-mono">${highlightMatch(address)}</span>
         <span class="row-actions">
             <button class="icon-btn" title="Copy address" onclick="event.stopPropagation(); copyAddress('${esc}')">📋</button>
             ${includeHide ? `<button class="icon-btn danger" title="Hide this wallet" onclick="event.stopPropagation(); hideWallet('${esc}')">🗑️</button>` : ""}
         </span>`;
+}
+
+// Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
+// highlighting/focusing a matching node instead of filtering a list).
+let analysisSearchQuery = "";
+let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null;
+
+function matchesSearch(text) {
+    if (!analysisSearchQuery) return true;
+    return (text || "").toLowerCase().includes(analysisSearchQuery);
+}
+
+function highlightMatch(text) {
+    const safe = escapeHtml(text == null ? "" : String(text));
+    if (!analysisSearchQuery) return safe;
+    const idx = safe.toLowerCase().indexOf(escapeHtml(analysisSearchQuery).toLowerCase());
+    if (idx === -1) return safe;
+    return safe.slice(0, idx) + '<mark class="search-hit">' + safe.slice(idx, idx + analysisSearchQuery.length) + "</mark>" + safe.slice(idx + analysisSearchQuery.length);
+}
+
+function onAnalysisSearch(value) {
+    analysisSearchQuery = value.trim().toLowerCase();
+    document.getElementById("analysisSearchClear").style.display = analysisSearchQuery ? "inline-block" : "none";
+    reapplyAnalysisSearch();
+}
+
+function clearAnalysisSearch() {
+    document.getElementById("analysisSearch").value = "";
+    onAnalysisSearch("");
+}
+
+// Re-renders the current tab from already-fetched data (no network round-trip per
+// keystroke). Falls back to a full load if nothing's cached yet for that tab.
+function reapplyAnalysisSearch() {
+    const container = document.getElementById("analysisContent");
+    if (currentAnalysisTab === "addresses") { if (cachedAddresses) renderAddresses(container); else loadAddresses(container); }
+    else if (currentAnalysisTab === "amounts") { if (cachedAmounts) renderAmounts(container); else loadAmounts(container); }
+    else if (currentAnalysisTab === "transfers") { if (cachedTransfers) renderTransfers(container); else loadTransfers(container); }
+    else if (currentAnalysisTab === "graph") focusGraphSearchMatch();
 }
 
 function copyAddress(address) {
@@ -1920,110 +1987,133 @@ function refreshHiddenWalletsSidebar() {
 
 function loadAmounts(container) {
     fetch("/analysis/amounts" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        if (!data.length) {
-            container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
-            return;
-        }
-        let html = `<div class="results-note">${data.length} transaction(s), sorted largest to smallest (USD-equivalent first when available).</div>`;
-        html += '<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
-        data.forEach(r => {
-            html += `<tr>
-                <td>${escapeHtml(r.suspect_name)}</td>
-                <td>${escapeHtml(r.exchange)}</td>
-                <td><span class="badge ${r.file_type}">${TYPE_LABELS[r.file_type] || r.file_type}</span></td>
-                <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
-                <td>${fmtDate(r.date)}</td>
-                <td>${truncMono(r.external_address)}</td>
-                <td>${truncMono(r.txid)}</td>
-            </tr>`;
-        });
-        html += "</tbody></table></div>";
-        container.innerHTML = html;
+        cachedAmounts = data;
+        renderAmounts(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
 }
 
+function renderAmounts(container) {
+    const data = cachedAmounts || [];
+    if (!data.length) {
+        container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
+        return;
+    }
+    const filtered = data.filter(r => matchesSearch(r.external_address) || matchesSearch(r.txid));
+    if (!filtered.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+    let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, sorted largest to smallest (USD-equivalent first when available).</div>`;
+    html += '<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+    filtered.forEach(r => {
+        html += `<tr>
+            <td>${escapeHtml(r.suspect_name)}</td>
+            <td>${escapeHtml(r.exchange)}</td>
+            <td><span class="badge ${r.file_type}">${TYPE_LABELS[r.file_type] || r.file_type}</span></td>
+            <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
+            <td>${fmtDate(r.date)}</td>
+            <td>${truncMono(r.external_address)}</td>
+            <td>${truncMono(r.txid)}</td>
+        </tr>`;
+    });
+    html += "</tbody></table></div>";
+    container.innerHTML = html;
+}
+
 function loadTransfers(container) {
     fetch("/analysis/transfers" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        const matched = data.matched || [];
-        const unmatched = data.unmatched || [];
-        if (!matched.length && !unmatched.length) {
-            container.innerHTML = '<div class="analysis-empty">No wallet-to-wallet transfers detected yet.</div>';
-            return;
-        }
-
-        const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
-        const samePersonCount = matched.length - diffPeopleCount;
-        const txidCount = matched.filter(p => p.match_type === "txid").length;
-
-        let html = `<div class="results-note">
-            ${matched.length} confirmed transfer(s) — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
-            ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
-            <b>${diffPeopleCount}</b> between <b>two different people</b>.
-            ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
-        </div>`;
-
-        matched.forEach(p => {
-            const w = p.withdrawal, d = p.deposit;
-            const who = p.same_suspect
-                ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
-                : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
-            const viaLabel = p.match_type === "txid"
-                ? `matching TX hash <span class="addr-mono">${escapeHtml(w.txid)}</span>`
-                : `shared address <span class="addr-mono">${escapeHtml(p.address)}</span>`;
-            html += `<div class="transfer-card">
-                <div class="addr-line">
-                    ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
-                    ${who} — via ${viaLabel}
-                    ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
-                    ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
-                    ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
-                </div>
-                <div class="transfer-flow">
-                    <div class="transfer-side">
-                        <div class="label">Sent (withdrawal)</div>
-                        <div class="exchange-name">${escapeHtml(w.exchange)}</div>
-                        <div>${escapeHtml(w.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(w.txid || "-")}</span></div>
-                    </div>
-                    <div class="transfer-arrow">→</div>
-                    <div class="transfer-side">
-                        <div class="label">Received (deposit)</div>
-                        <div class="exchange-name">${escapeHtml(d.exchange)}</div>
-                        <div>${escapeHtml(d.suspect_name)}</div>
-                        <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
-                        <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
-                        <div class="txid-line">TX Hash: <span class="addr-mono">${escapeHtml(d.txid || "-")}</span></div>
-                    </div>
-                </div>
-                <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
-            </div>`;
-        });
-
-        if (unmatched.length) {
-            html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
-            html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
-            unmatched.forEach(u => {
-                html += `<tr>
-                    <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
-                    <td>${escapeHtml(u.suspect_name)}</td>
-                    <td>${escapeHtml(u.exchange)}</td>
-                    <td>${fmtAmount(u.amount, u.currency)}</td>
-                    <td>${fmtDate(u.date)}</td>
-                    <td>${truncMono(u.address)}</td>
-                    <td>${truncMono(u.txid)}</td>
-                </tr>`;
-            });
-            html += "</tbody></table></div>";
-        }
-
-        container.innerHTML = html;
+        cachedTransfers = data;
+        renderTransfers(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+function renderTransfers(container) {
+    const allMatched = (cachedTransfers && cachedTransfers.matched) || [];
+    const allUnmatched = (cachedTransfers && cachedTransfers.unmatched) || [];
+    if (!allMatched.length && !allUnmatched.length) {
+        container.innerHTML = '<div class="analysis-empty">No wallet-to-wallet transfers detected yet.</div>';
+        return;
+    }
+
+    const matched = allMatched.filter(p => matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid));
+    const unmatched = allUnmatched.filter(u => matchesSearch(u.address) || matchesSearch(u.txid));
+    if (!matched.length && !unmatched.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+
+    const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
+    const samePersonCount = matched.length - diffPeopleCount;
+    const txidCount = matched.filter(p => p.match_type === "txid").length;
+
+    let html = `<div class="results-note">
+        ${matched.length}${analysisSearchQuery ? ` of ${allMatched.length}` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
+        ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
+        <b>${diffPeopleCount}</b> between <b>two different people</b>.
+        ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
+    </div>`;
+
+    matched.forEach(p => {
+        const w = p.withdrawal, d = p.deposit;
+        const who = p.same_suspect
+            ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
+            : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
+        const viaLabel = p.match_type === "txid"
+            ? `matching TX hash <span class="addr-mono">${highlightMatch(w.txid)}</span>`
+            : `shared address <span class="addr-mono">${highlightMatch(p.address)}</span>`;
+        html += `<div class="transfer-card">
+            <div class="addr-line">
+                ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
+                ${who} — via ${viaLabel}
+                ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
+                ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
+                ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
+            </div>
+            <div class="transfer-flow">
+                <div class="transfer-side">
+                    <div class="label">Sent (withdrawal)</div>
+                    <div class="exchange-name">${escapeHtml(w.exchange)}</div>
+                    <div>${escapeHtml(w.suspect_name)}</div>
+                    <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
+                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
+                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
+                </div>
+                <div class="transfer-arrow">→</div>
+                <div class="transfer-side">
+                    <div class="label">Received (deposit)</div>
+                    <div class="exchange-name">${escapeHtml(d.exchange)}</div>
+                    <div>${escapeHtml(d.suspect_name)}</div>
+                    <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
+                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
+                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
+                </div>
+            </div>
+            <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
+        </div>`;
+    });
+
+    if (unmatched.length) {
+        html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
+        html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+        unmatched.forEach(u => {
+            html += `<tr>
+                <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
+                <td>${escapeHtml(u.suspect_name)}</td>
+                <td>${escapeHtml(u.exchange)}</td>
+                <td>${fmtAmount(u.amount, u.currency)}</td>
+                <td>${fmtDate(u.date)}</td>
+                <td>${truncMono(u.address)}</td>
+                <td>${truncMono(u.txid)}</td>
+            </tr>`;
+        });
+        html += "</tbody></table></div>";
+    }
+
+    container.innerHTML = html;
 }
 
 let graphNetworkInstance = null;
@@ -2056,6 +2146,7 @@ function loadGraph(container) {
 
     fetch("/analysis/graph" + suspectsQueryParam()).then(r => r.json()).then(data => {
         if (!data.nodes.length) {
+            if (graphNetworkInstance) { graphNetworkInstance.destroy(); graphNetworkInstance = null; }
             document.getElementById("graphCanvas").outerHTML =
                 '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
             return;
@@ -2107,6 +2198,8 @@ function loadGraph(container) {
         graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
         graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
         graphNetworkInstance.on("zoom", () => { toolbar.style.display = "none"; });
+
+        focusGraphSearchMatch();
     }).catch(err => {
         document.getElementById("graphCanvas").outerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
     });
@@ -2118,6 +2211,28 @@ function scheduleHideGraphToolbar() {
         const toolbar = document.getElementById("graphNodeToolbar");
         if (toolbar) toolbar.style.display = "none";
     }, 250);
+}
+
+// Graph tab has no per-row list to filter, so the shared search box instead selects and
+// centers on the matching wallet node (by address) or, failing that, the matching
+// TXID-confirmed edge - same search box, same query, adapted to a graph instead of a table.
+function focusGraphSearchMatch() {
+    if (!graphNetworkInstance) return;
+    if (!analysisSearchQuery) { graphNetworkInstance.unselectAll(); return; }
+
+    const nodeMatch = graphNetworkInstance.body.data.nodes.get().find(n => matchesSearch(n.title));
+    if (nodeMatch) {
+        graphNetworkInstance.selectNodes([nodeMatch.id]);
+        graphNetworkInstance.focus(nodeMatch.id, { scale: 1.3, animation: true });
+        return;
+    }
+    const edgeMatch = graphNetworkInstance.body.data.edges.get().find(e => matchesSearch(e.title));
+    if (edgeMatch) {
+        graphNetworkInstance.selectEdges([edgeMatch.id]);
+        graphNetworkInstance.focus(edgeMatch.from, { scale: 1.2, animation: true });
+        return;
+    }
+    graphNetworkInstance.unselectAll();
 }
 
 
