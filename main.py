@@ -4,10 +4,11 @@ Run with: python main.py
 Then open: http://127.0.0.1:5000
 """
 
-from flask import Flask, request, jsonify, render_template_string, send_file
+from flask import Flask, request, jsonify, send_file
 import pandas as pd
 import uuid
 import io
+import os
 import traceback
 from datetime import datetime
 from docx import Document
@@ -19,6 +20,13 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSON responses
+
+# The Graph tab's vis-network library is embedded directly into the page (see index()
+# below) instead of loaded from a CDN or a separate /static request - this used to pull
+# from unpkg.com at runtime, which silently breaks the whole tab on any offline/restricted
+# network (common for forensic workstations). Vendored file, read once at startup.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vis-network.min.js"), encoding="utf-8") as _f:
+    VIS_NETWORK_JS = _f.read()
 
 # In-memory storage (no database yet)
 SUSPECTS = {}   # suspect_id -> {"name": str}
@@ -210,7 +218,7 @@ def detect_file_type(filename, sheet_name, columns):
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_PAGE)
+    return HTML_PAGE.replace("%%VIS_NETWORK_JS%%", VIS_NETWORK_JS, 1)
 
 
 @app.route("/suspects", methods=["GET"])
@@ -509,69 +517,90 @@ def _pair_score(w, d):
 
 
 def compute_transfers_analysis(suspect_ids=None):
-    """Matches withdrawals to deposits that share the same external address, deposit
-    occurring after the withdrawal - i.e. money leaving one wallet and later re-appearing
-    from the same wallet elsewhere (same exchange or a different one; same person's own
-    accounts, or two different people).
+    """Links a withdrawal to a deposit two ways, in priority order:
 
-    Each withdrawal is matched to AT MOST ONE deposit (and vice versa): for every address,
-    all valid (withdrawal, deposit) candidates are scored by currency/amount closeness then
-    time gap, and greedily paired off best-match-first. This avoids the earlier all-with-all
-    behaviour, which turned e.g. 3 withdrawals + 4 deposits on one address into up to 12
-    "transfers" - wildly overcounting a handful of real movements.
+    1. TXID match (confirmed): the exact same blockchain transaction hash was logged by
+       both sides - one exchange recorded it as an outgoing withdrawal, another (or the same
+       one) recorded it as an incoming deposit. Same hash = definitely the same transfer, no
+       guessing. This also catches cases where one side's export has no usable address column
+       at all but does log the tx hash.
+    2. Address match (probable): no shared txid, but the withdrawal's destination address
+       equals a later deposit's source address. Heuristic - ranked by currency/amount
+       closeness then time gap.
+
+    Every row is matched to AT MOST ONE counterpart: txid matching runs first and claims
+    what it can with certainty, then address matching runs on whatever's left, greedily
+    pairing best-match-first. This avoids pairing every withdrawal on an address with every
+    later deposit on it (the earlier bug, which turned e.g. 3 withdrawals + 4 deposits on one
+    address into up to 12 fabricated "transfers").
 
     Returns {"matched": [...], "unmatched": [...]}. Unmatched entries are withdrawals/deposits
-    that reused a shared address but couldn't be confidently paired with anything (e.g. a
-    withdrawal with no later deposit from that address yet) - still worth a human's attention,
-    listed separately rather than silently dropped or force-matched.
+    that had a txid or address to work with but couldn't be confidently linked to anything -
+    still worth a human's attention, listed separately rather than dropped or force-matched.
     """
-    rows = [r for r in get_all_transactions(suspect_ids) if r["external_address"] and r["date"] is not None]
+    rows = [r for r in get_all_transactions(suspect_ids)
+            if r["date"] is not None and (r["txid"] or r["external_address"])]
+    claimed = [False] * len(rows)
+    matched = []
 
+    def emit(wi, di, match_type):
+        w, d = rows[wi], rows[di]
+        tier, rel_diff, _ = _pair_score(w, d)
+        claimed[wi] = claimed[di] = True
+        matched.append({
+            "address": w["external_address"] or d["external_address"],
+            "match_type": match_type,
+            "withdrawal": _transfer_side(w),
+            "deposit": _transfer_side(d),
+            "gap_hours": round(abs((d["date"] - w["date"]).total_seconds()) / 3600, 2),
+            "same_suspect": w["suspect_id"] == d["suspect_id"],
+            "same_exchange": w["exchange"] == d["exchange"],
+            "amount_matched": tier == 0,
+            "amount_diff_pct": round(rel_diff * 100, 2) if tier == 0 else None,
+        })
+
+    # Pass 1: exact TXID match - highest confidence, runs first so it claims rows before
+    # the address heuristic gets a chance to guess wrong.
+    by_txid = {}
+    for i, r in enumerate(rows):
+        if r["txid"]:
+            by_txid.setdefault(r["txid"].strip().lower(), []).append(i)
+    for idxs in by_txid.values():
+        withdrawals = [i for i in idxs if rows[i]["file_type"] == "withdrawal"]
+        deposits = [i for i in idxs if rows[i]["file_type"] == "deposit"]
+        candidates = sorted(
+            (abs((rows[di]["date"] - rows[wi]["date"]).total_seconds()), wi, di)
+            for wi in withdrawals for di in deposits
+        )
+        for _, wi, di in candidates:
+            if not claimed[wi] and not claimed[di]:
+                emit(wi, di, "txid")
+
+    # Pass 2: shared external address (only rows the txid pass didn't already claim).
     by_address = {}
-    for r in rows:
-        by_address.setdefault(r["external_address"].lower(), []).append(r)
-
-    matched, unmatched = [], []
-    for addr_lower, occurrences in by_address.items():
-        addr = occurrences[0]["external_address"]
-        withdrawals = [o for o in occurrences if o["file_type"] == "withdrawal"]
-        deposits = [o for o in occurrences if o["file_type"] == "deposit"]
-
+    for i, r in enumerate(rows):
+        if not claimed[i] and r["external_address"]:
+            by_address.setdefault(r["external_address"].lower(), []).append(i)
+    for idxs in by_address.values():
+        withdrawals = [i for i in idxs if rows[i]["file_type"] == "withdrawal"]
+        deposits = [i for i in idxs if rows[i]["file_type"] == "deposit"]
         candidates = []
-        for wi, w in enumerate(withdrawals):
-            for di, d in enumerate(deposits):
-                if d["date"] < w["date"]:
+        for wi in withdrawals:
+            for di in deposits:
+                if rows[di]["date"] < rows[wi]["date"]:
                     continue  # deposit happened before the withdrawal - not this direction
-                candidates.append((_pair_score(w, d), wi, di))
+                candidates.append((_pair_score(rows[wi], rows[di]), wi, di))
         candidates.sort(key=lambda c: c[0])
-
-        matched_w_idx, matched_d_idx = set(), set()
         for score, wi, di in candidates:
-            if wi in matched_w_idx or di in matched_d_idx:
-                continue  # withdrawal or deposit already claimed by a better-scoring match
-            matched_w_idx.add(wi)
-            matched_d_idx.add(di)
-            w, d = withdrawals[wi], deposits[di]
-            tier, rel_diff, gap_hours = score
-            matched.append({
-                "address": addr,
-                "withdrawal": _transfer_side(w),
-                "deposit": _transfer_side(d),
-                "gap_hours": round(gap_hours, 2),
-                "same_suspect": w["suspect_id"] == d["suspect_id"],
-                "same_exchange": w["exchange"] == d["exchange"],
-                "amount_matched": tier == 0,
-                "amount_diff_pct": round(rel_diff * 100, 2) if tier == 0 else None,
-            })
+            if not claimed[wi] and not claimed[di]:
+                emit(wi, di, "address")
 
-        for wi, w in enumerate(withdrawals):
-            if wi not in matched_w_idx:
-                unmatched.append({"address": addr, "direction": "withdrawal", **_transfer_side(w)})
-        for di, d in enumerate(deposits):
-            if di not in matched_d_idx:
-                unmatched.append({"address": addr, "direction": "deposit", **_transfer_side(d)})
+    unmatched = [
+        {"address": r["external_address"], "direction": r["file_type"], **_transfer_side(r)}
+        for i, r in enumerate(rows) if not claimed[i]
+    ]
 
-    matched.sort(key=lambda p: p["gap_hours"])
+    matched.sort(key=lambda p: (p["match_type"] != "txid", p["gap_hours"]))
     unmatched.sort(key=lambda u: u["date"], reverse=True)
     return {"matched": matched, "unmatched": unmatched}
 
@@ -662,12 +691,13 @@ def export_xlsx(suspect_ids=None):
 
     # --- Transfers sheet (one confirmed withdrawal <-> deposit match per row) ---
     ws3 = wb.create_sheet("Transfers")
-    write_header(ws3, ["Address", "Same Person", "Same Exchange", "Amount Match", "Gap (hours)",
+    write_header(ws3, ["Match Type", "Address", "Same Person", "Same Exchange", "Amount Match", "Gap (hours)",
                         "Withdrawal Suspect", "Withdrawal Exchange", "Withdrawal Amount", "Withdrawal Date", "Withdrawal TXID",
                         "Deposit Suspect", "Deposit Exchange", "Deposit Amount", "Deposit Date", "Deposit TXID"])
     for p in ctx["transfers"]["matched"]:
         w, d = p["withdrawal"], p["deposit"]
         ws3.append([
+            "TXID" if p["match_type"] == "txid" else "Address",
             p["address"], "YES" if p["same_suspect"] else "NO", "YES" if p["same_exchange"] else "NO",
             "YES" if p["amount_matched"] else "unverified", p["gap_hours"],
             w["suspect_name"], w["exchange"], w["amount"], _fmt_date_export(w["date"]), w["txid"],
@@ -768,8 +798,12 @@ def export_docx(suspect_ids=None):
     for p in matched:
         w, d = p["withdrawal"], p["deposit"]
         para = doc.add_paragraph()
+        if p["match_type"] == "txid":
+            tag = para.add_run("[CONFIRMED - SAME TXID]  ")
+            tag.bold = True
+            tag.font.color.rgb = RGBColor(0x0F, 0x8A, 0x4E)
         para.add_run(f"Address: ").bold = True
-        run = para.add_run(p["address"])
+        run = para.add_run(p["address"] or "-")
         run.font.name = "Consolas"
         if not p["same_suspect"]:
             warn = para.add_run("  [DIFFERENT PEOPLE]")
@@ -800,7 +834,7 @@ def export_docx(suspect_ids=None):
     if unmatched:
         doc.add_heading("Unmatched movements (needs manual review)", level=1)
         doc.add_paragraph(
-            f"{len(unmatched)} withdrawal(s)/deposit(s) reused a shared address but couldn't be "
+            f"{len(unmatched)} withdrawal(s)/deposit(s) couldn't be "
             f"confidently paired with a counterpart."
         )
         table = doc.add_table(rows=1, cols=6)
@@ -900,14 +934,14 @@ def export_pdf(suspect_ids=None):
     transfer_rows = []
     for p in matched:
         w, d = p["withdrawal"], p["deposit"]
-        flags = []
+        flags = ["TXID" if p["match_type"] == "txid" else "address"]
         flags.append("DIFF. PEOPLE" if not p["same_suspect"] else "same person")
         if not p["same_exchange"]:
             flags.append("cross-exch.")
         if not p["amount_matched"]:
             flags.append("unverified amt")
         transfer_rows.append([
-            p["address"][:30], " / ".join(flags), str(p["gap_hours"]),
+            (p["address"] or "-")[:30], " / ".join(flags), str(p["gap_hours"]),
             f"{w['exchange']}/{w['suspect_name']}", _fmt_amount_export(w["amount"], w["currency"]), _fmt_date_export(w["date"]),
             f"{d['exchange']}/{d['suspect_name']}", _fmt_amount_export(d["amount"], d["currency"]), _fmt_date_export(d["date"]),
         ])
@@ -923,7 +957,7 @@ def export_pdf(suspect_ids=None):
     if unmatched:
         elements.append(Paragraph("Unmatched movements (needs manual review)", styles["Heading1"]))
         elements.append(Paragraph(
-            f"{len(unmatched)} withdrawal(s)/deposit(s) reused a shared address but couldn't be "
+            f"{len(unmatched)} withdrawal(s)/deposit(s) couldn't be "
             f"confidently paired with a counterpart.", styles["Normal"]))
         elements.append(Spacer(1, 6))
         unmatched_rows = [[
@@ -1023,6 +1057,24 @@ def compute_graph_data(suspect_ids=None):
                 "value": agg["count"], "title": title,
             })
 
+    # Direct suspect-to-suspect edges for TXID-confirmed transfers between two different
+    # people. Needed on top of the address-sharing loop above because a TXID match can link
+    # two people even when no usable shared address exists (e.g. one side's export only logs
+    # an internal/exchange address, not the counterparty's - see compute_transfers_analysis).
+    for p in compute_transfers_analysis(suspect_ids)["matched"]:
+        if p["match_type"] != "txid" or p["same_suspect"]:
+            continue
+        w, d = p["withdrawal"], p["deposit"]
+        for suspect_id, name in ((w["suspect_id"], w["suspect_name"]), (d["suspect_id"], d["suspect_name"])):
+            node_id = f"suspect:{suspect_id}"
+            if node_id not in nodes:
+                nodes[node_id] = {"id": node_id, "label": name, "title": name, "group": "suspect"}
+        edges.append({
+            "from": f"suspect:{w['suspect_id']}", "to": f"suspect:{d['suspect_id']}",
+            "value": 3, "color": {"color": "#3ecf8e"},
+            "title": f"Confirmed transfer (same TXID {w['txid']}) — {w['amount']} {w['currency']} on {w['exchange']} → {d['exchange']}",
+        })
+
     return {"nodes": list(nodes.values()), "edges": edges}
 
 
@@ -1048,7 +1100,7 @@ HTML_PAGE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CryptoLink - Exchange File Import</title>
-<script src="/static/vis-network.min.js"></script>
+<script>%%VIS_NETWORK_JS%%</script>
 <style>
     :root {
         --bg: #0f1420; --bg-card: #171d2e; --border: #2a3348;
@@ -1752,10 +1804,11 @@ function loadTransfers(container) {
 
         const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
         const samePersonCount = matched.length - diffPeopleCount;
+        const txidCount = matched.filter(p => p.match_type === "txid").length;
 
         let html = `<div class="results-note">
-            ${matched.length} confirmed transfer(s) — each withdrawal matched to the single most likely deposit
-            (closest amount/currency, then closest time). <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
+            ${matched.length} confirmed transfer(s) — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
+            ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
             <b>${diffPeopleCount}</b> between <b>two different people</b>.
             ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
         </div>`;
@@ -1765,9 +1818,13 @@ function loadTransfers(container) {
             const who = p.same_suspect
                 ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
                 : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
+            const viaLabel = p.match_type === "txid"
+                ? `matching TX hash <span class="addr-mono">${escapeHtml(w.txid)}</span>`
+                : `shared address <span class="addr-mono">${escapeHtml(p.address)}</span>`;
             html += `<div class="transfer-card">
                 <div class="addr-line">
-                    ${who} — via <span class="addr-mono">${escapeHtml(p.address)}</span>
+                    ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
+                    ${who} — via ${viaLabel}
                     ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
                     ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
                     ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
@@ -1823,11 +1880,12 @@ let graphNetworkInstance = null;
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only wallets connecting two different accounts are shown - a different suspect, or the same suspect on two exchanges.</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
                 <span class="legend-item"><span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
         </div>
         <div id="graphCanvas"></div>
