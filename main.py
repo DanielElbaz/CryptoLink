@@ -2968,14 +2968,18 @@ let graphNetworkInstance = null;
 
 let graphToolbarHideTimer = null;
 
+let cachedGraphData = null;
+
+let graphColorFilters = { cross: true, same: true };
+
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
             <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Hover a wallet node for actions.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
-                <span class="legend-item"><span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</span>
-                <span class="legend-item"><span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</span>
+                <label class="graph-toggle"><input type="checkbox" id="graphFilterCross" ${graphColorFilters.cross ? "checked" : ""} onchange="setGraphColorFilter('cross', this.checked)"> <span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</label>
+                <label class="graph-toggle"><input type="checkbox" id="graphFilterSame" ${graphColorFilters.same ? "checked" : ""} onchange="setGraphColorFilter('same', this.checked)"> <span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</label>
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
         </div>
@@ -2994,68 +2998,109 @@ function loadGraph(container) {
     toolbar.addEventListener("mouseleave", scheduleHideGraphToolbar);
 
     fetch("/analysis/graph" + suspectsQueryParam()).then(r => r.json()).then(data => {
-        if (!data.nodes.length) {
-            if (graphNetworkInstance) { graphNetworkInstance.destroy(); graphNetworkInstance = null; }
-            document.getElementById("graphCanvas").outerHTML =
-                '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
-            return;
-        }
-
-        const nodes = new vis.DataSet(data.nodes);
-        const edges = new vis.DataSet(data.edges);
-        const isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
-
-        const options = {
-            nodes: {
-                shape: "dot", size: 16, font: { color: isLightTheme ? "#1a1f2b" : "#e6e9f0", size: 12 },
-                borderWidth: 2,
-            },
-            edges: {
-                color: { color: "#3a4258", highlight: "#4f8cff" },
-                smooth: { type: "continuous" },
-                scaling: { min: 1, max: 8 },
-            },
-            groups: {
-                suspect: { color: { background: "#4f8cff", border: "#2a4a8a" }, shape: "dot", size: 22 },
-                address_shared_cross_suspect: { color: { background: "#f0556b", border: "#8a2030" } },
-                address_shared_same_suspect: { color: { background: "#f5a623", border: "#8a5c10" } },
-            },
-            physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
-            interaction: { hover: true, tooltipDelay: 100, dragNodes: true },
-        };
-
-        if (graphNetworkInstance) graphNetworkInstance.destroy();
-        graphNetworkInstance = new vis.Network(document.getElementById("graphCanvas"), { nodes, edges }, options);
-        // Physics only runs for the initial layout. Once it settles, turn it off so dragging
-        // one node repositions just that node instead of the whole graph reacting/reshuffling.
-        graphNetworkInstance.once("stabilizationIterationsDone", () => {
-            graphNetworkInstance.setOptions({ physics: false });
-        });
-
-        // Hover a wallet node -> show a small floating copy/hide toolbar next to it (suspect
-        // nodes can't be hidden, so they get no toolbar). A short delay on hide lets the
-        // mouse travel from the node onto the toolbar itself without it disappearing first.
-        graphNetworkInstance.on("hoverNode", params => {
-            const node = nodes.get(params.node);
-            if (!node.group || !node.group.startsWith("address_shared")) return;
-            clearTimeout(graphToolbarHideTimer);
-            const pos = graphNetworkInstance.canvasToDOM(graphNetworkInstance.getPositions([params.node])[params.node]);
-            toolbar.style.left = (pos.x + 16) + "px";
-            toolbar.style.top = (pos.y - 14) + "px";
-            toolbar.style.display = "flex";
-            toolbar.dataset.address = node.title;
-            const noteIcon = document.getElementById("graphNodeNoteIcon");
-            noteIcon.style.display = node.note ? "inline-block" : "none";
-            noteIcon.title = node.note || "";
-        });
-        graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
-        graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
-        graphNetworkInstance.on("zoom", () => { toolbar.style.display = "none"; });
-
-        focusGraphSearchMatch();
+        cachedGraphData = data;
+        renderGraph();
     }).catch(err => {
-        document.getElementById("graphCanvas").outerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
+        const canvas = document.getElementById("graphCanvas");
+        if (canvas) canvas.innerHTML = `<div class="analysis-empty">Error loading graph: ${escapeHtml(String(err))}</div>`;
     });
+}
+
+// Toggling a legend checkbox re-filters the already-fetched graph in place, no re-fetch
+// needed - same pattern as the Transfers same/different-person filter.
+function setGraphColorFilter(kind, checked) {
+    graphColorFilters[kind] = checked;
+    renderGraph();
+}
+
+function renderGraph() {
+    const data = cachedGraphData;
+    const canvas = document.getElementById("graphCanvas");
+    if (!data || !canvas) return;
+
+    if (graphNetworkInstance) { graphNetworkInstance.destroy(); graphNetworkInstance = null; }
+
+    if (!data.nodes.length) {
+        canvas.innerHTML = '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
+        return;
+    }
+
+    const hiddenGroups = new Set();
+    if (!graphColorFilters.cross) hiddenGroups.add("address_shared_cross_suspect");
+    if (!graphColorFilters.same) hiddenGroups.add("address_shared_same_suspect");
+
+    const keptNodeIds = new Set(data.nodes.filter(n => !hiddenGroups.has(n.group)).map(n => n.id));
+    let visibleEdges = data.edges.filter(e => keptNodeIds.has(e.from) && keptNodeIds.has(e.to));
+
+    // A suspect left with zero remaining edges once a wallet color is hidden would just be
+    // an isolated dot - drop those too for a cleaner result.
+    const connectedIds = new Set();
+    visibleEdges.forEach(e => { connectedIds.add(e.from); connectedIds.add(e.to); });
+    const visibleNodes = data.nodes.filter(n => {
+        if (!keptNodeIds.has(n.id)) return false;
+        return n.group !== "suspect" || connectedIds.has(n.id);
+    });
+    const finalIds = new Set(visibleNodes.map(n => n.id));
+    visibleEdges = visibleEdges.filter(e => finalIds.has(e.from) && finalIds.has(e.to));
+
+    if (!visibleNodes.length) {
+        canvas.innerHTML = '<div class="analysis-empty">No wallet matches the current filters.</div>';
+        return;
+    }
+    canvas.innerHTML = "";
+
+    const nodes = new vis.DataSet(visibleNodes);
+    const edges = new vis.DataSet(visibleEdges);
+    const isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
+    const toolbar = document.getElementById("graphNodeToolbar");
+
+    const options = {
+        nodes: {
+            shape: "dot", size: 16, font: { color: isLightTheme ? "#1a1f2b" : "#e6e9f0", size: 12 },
+            borderWidth: 2,
+        },
+        edges: {
+            color: { color: "#3a4258", highlight: "#4f8cff" },
+            smooth: { type: "continuous" },
+            scaling: { min: 1, max: 8 },
+        },
+        groups: {
+            suspect: { color: { background: "#4f8cff", border: "#2a4a8a" }, shape: "dot", size: 22 },
+            address_shared_cross_suspect: { color: { background: "#f0556b", border: "#8a2030" } },
+            address_shared_same_suspect: { color: { background: "#f5a623", border: "#8a5c10" } },
+        },
+        physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
+        interaction: { hover: true, tooltipDelay: 100, dragNodes: true },
+    };
+
+    graphNetworkInstance = new vis.Network(canvas, { nodes, edges }, options);
+    // Physics only runs for the initial layout. Once it settles, turn it off so dragging
+    // one node repositions just that node instead of the whole graph reacting/reshuffling.
+    graphNetworkInstance.once("stabilizationIterationsDone", () => {
+        graphNetworkInstance.setOptions({ physics: false });
+    });
+
+    // Hover a wallet node -> show a small floating copy/hide toolbar next to it (suspect
+    // nodes can't be hidden, so they get no toolbar). A short delay on hide lets the
+    // mouse travel from the node onto the toolbar itself without it disappearing first.
+    graphNetworkInstance.on("hoverNode", params => {
+        const node = nodes.get(params.node);
+        if (!node.group || !node.group.startsWith("address_shared")) return;
+        clearTimeout(graphToolbarHideTimer);
+        const pos = graphNetworkInstance.canvasToDOM(graphNetworkInstance.getPositions([params.node])[params.node]);
+        toolbar.style.left = (pos.x + 16) + "px";
+        toolbar.style.top = (pos.y - 14) + "px";
+        toolbar.style.display = "flex";
+        toolbar.dataset.address = node.title;
+        const noteIcon = document.getElementById("graphNodeNoteIcon");
+        noteIcon.style.display = node.note ? "inline-block" : "none";
+        noteIcon.title = node.note || "";
+    });
+    graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
+    graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
+    graphNetworkInstance.on("zoom", () => { toolbar.style.display = "none"; });
+
+    focusGraphSearchMatch();
 }
 
 function scheduleHideGraphToolbar() {
