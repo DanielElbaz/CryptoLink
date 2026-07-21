@@ -2477,7 +2477,18 @@ function loadCase(file) {
 }
 
 
-refreshSuspects();
+// All state lives server-side (SUSPECTS/CATALOG in memory) - a page refresh doesn't lose
+// anything on the server, but catalogData is a client-side JS object that starts empty on
+// every page load, so without this the Files tab would show "No files imported yet." right
+// after a refresh even though the server still has everything.
+function initApp() {
+    fetch("/files").then(r => r.json()).then(files => {
+        files.forEach(item => { catalogData[item.id] = item; });
+        refreshSuspects();
+    });
+}
+
+initApp();
 </script>
 
 </body>
