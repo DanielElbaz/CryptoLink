@@ -570,6 +570,40 @@ def _transfer_side(o):
     }
 
 
+# Hard requirements for an ADDRESS-based (heuristic) match - unlike a TXID match (proof),
+# address reuse alone is circumstantial and needs corroboration to count as a real transfer
+# instead of coincidental/unrelated reuse of the same wallet months apart.
+ADDRESS_MATCH_AMOUNT_TOLERANCE = 0.05   # max 5% relative difference when both amounts are known
+ADDRESS_MATCH_MAX_GAP_HOURS = 7 * 24    # max 7 days between the withdrawal and the deposit
+
+
+def _amount_rel_diff(w, d):
+    """Relative amount difference between a withdrawal and a deposit, or None if they're not
+    in the same currency or either side's amount is missing (nothing to compare)."""
+    same_currency = (
+        w["currency"] is not None and d["currency"] is not None
+        and w["currency"].strip().upper() == d["currency"].strip().upper()
+    )
+    if same_currency and w["amount"] and d["amount"]:
+        return abs(w["amount"] - d["amount"]) / max(abs(w["amount"]), abs(d["amount"]), 1e-9)
+    return None
+
+
+def _address_match_ok(w, d):
+    """Gate for ADDRESS-based candidates only (see compute_transfers_analysis pass 2): reject
+    pairs more than 7 days apart, and reject pairs whose amounts are both known but differ by
+    more than 5% - either one on its own means the address getting reused is most likely
+    unrelated reuse (e.g. a suspect's own wallet used for many separate transactions), not
+    this specific transfer."""
+    gap_hours = (d["date"] - w["date"]).total_seconds() / 3600
+    if gap_hours > ADDRESS_MATCH_MAX_GAP_HOURS:
+        return False
+    rel_diff = _amount_rel_diff(w, d)
+    if rel_diff is not None and rel_diff > ADDRESS_MATCH_AMOUNT_TOLERANCE:
+        return False
+    return True
+
+
 def _pair_score(w, d):
     """Ranks a candidate (withdrawal, deposit) match sharing the same external address.
     Lower is better. Same-currency pairs whose amounts are close (tier 0) always outrank
@@ -577,13 +611,7 @@ def _pair_score(w, d):
     this is what lets the 1-to-1 matching below pick the single most plausible deposit for
     each withdrawal instead of pairing every withdrawal with every later deposit."""
     gap_hours = (d["date"] - w["date"]).total_seconds() / 3600
-    same_currency = (
-        w["currency"] is not None and d["currency"] is not None
-        and w["currency"].strip().upper() == d["currency"].strip().upper()
-    )
-    rel_diff = None
-    if same_currency and w["amount"] and d["amount"]:
-        rel_diff = abs(w["amount"] - d["amount"]) / max(abs(w["amount"]), abs(d["amount"]), 1e-9)
+    rel_diff = _amount_rel_diff(w, d)
     tier = 0 if rel_diff is not None else 1
     return (tier, rel_diff if rel_diff is not None else 0.0, gap_hours)
 
@@ -597,8 +625,12 @@ def compute_transfers_analysis(suspect_ids=None):
        guessing. This also catches cases where one side's export has no usable address column
        at all but does log the tx hash.
     2. Address match (probable): no shared txid, but the withdrawal's destination address
-       equals a later deposit's source address. Heuristic - ranked by currency/amount
-       closeness then time gap.
+       equals a later deposit's source address. Heuristic - only accepted within 7 days and
+       (when the amount is known on both sides) within 5% of each other (see
+       _address_match_ok); ranked among surviving candidates by amount closeness then time
+       gap. Without these gates, any two unrelated transactions that happened to reuse the
+       same wallet months apart and for wildly different amounts would get shown as a
+       "transfer" just because nothing better was available for that address.
 
     Every row is matched to AT MOST ONE counterpart: txid matching runs first and claims
     what it can with certainty, then address matching runs on whatever's left, greedily
@@ -662,6 +694,8 @@ def compute_transfers_analysis(suspect_ids=None):
             for di in deposits:
                 if rows[di]["date"] < rows[wi]["date"]:
                     continue  # deposit happened before the withdrawal - not this direction
+                if not _address_match_ok(rows[wi], rows[di]):
+                    continue  # too far apart in time or amount - likely unrelated reuse of the address
                 candidates.append((_pair_score(rows[wi], rows[di]), wi, di))
         candidates.sort(key=lambda c: c[0])
         for score, wi, di in candidates:
