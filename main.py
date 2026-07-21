@@ -9,6 +9,7 @@ import pandas as pd
 import uuid
 import io
 import os
+import json
 import traceback
 from datetime import datetime
 from docx import Document
@@ -260,6 +261,18 @@ def delete_suspect(suspect_id):
 # ---------------------------------------------------------------------------
 # ROUTES - FILES
 # ---------------------------------------------------------------------------
+
+@app.route("/files", methods=["GET"])
+def list_files():
+    """Every catalogued file across all suspects, in the same shape /upload returns per file -
+    used to repopulate the Files tab client-side after a case is loaded (no re-upload needed)."""
+    return jsonify([{
+        "id": file_id, "filename": entry["filename"], "sheet_name": entry["sheet_name"],
+        "exchange": entry["exchange"], "file_type": entry["file_type"],
+        "columns": entry["columns"], "row_count": entry["row_count"],
+        "suspect_id": entry["suspect_id"], "missing_fields": entry["missing_fields"],
+    } for file_id, entry in CATALOG.items()])
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -1149,6 +1162,95 @@ def delete_file(file_id):
 
 
 # ---------------------------------------------------------------------------
+# CASE SAVE / LOAD
+# ---------------------------------------------------------------------------
+# Everything above lives only in memory (SUSPECTS/CATALOG/EXCLUDED_ADDRESSES) - a server
+# restart or crash wipes an entire investigation with no way back. These two routes let a
+# case be saved to a single JSON file and reloaded later (same machine or a different one),
+# preserving suspects, every imported file's data, and hidden-wallet choices.
+
+CASE_FORMAT_VERSION = 1
+
+
+@app.route("/case/export")
+def export_case():
+    files = []
+    for file_id, entry in CATALOG.items():
+        ndf = entry.get("normalized_dataframe")
+        files.append({
+            "file_id": file_id,
+            "filename": entry["filename"], "sheet_name": entry["sheet_name"],
+            "exchange": entry["exchange"], "file_type": entry["file_type"],
+            "columns": entry["columns"], "row_count": entry["row_count"],
+            "suspect_id": entry["suspect_id"], "missing_fields": entry["missing_fields"],
+            # pandas' own JSON round-trip handles dates/NaN/dtypes correctly, which a naive
+            # to_dict() + json.dumps() would mangle (Timestamps, NaN floats aren't JSON-safe).
+            "dataframe_json": entry["dataframe"].to_json(orient="records", date_format="iso"),
+            "normalized_dataframe_json": ndf.to_json(orient="records", date_format="iso") if ndf is not None else None,
+        })
+
+    case = {
+        "cryptolink_case_version": CASE_FORMAT_VERSION,
+        "saved_at": datetime.now().isoformat(),
+        "suspects": SUSPECTS,
+        "excluded_addresses": EXCLUDED_ADDRESSES,
+        "files": files,
+    }
+    buf = io.BytesIO(json.dumps(case, ensure_ascii=False, indent=2).encode("utf-8"))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(buf, as_attachment=True, download_name=f"cryptolink_case_{stamp}.json",
+                      mimetype="application/json")
+
+
+@app.route("/case/import", methods=["POST"])
+def import_case():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file received"}), 400
+
+    try:
+        case = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"Not a valid CryptoLink case file: {str(e)}"}), 400
+
+    if "suspects" not in case or "files" not in case:
+        return jsonify({"error": "Not a valid CryptoLink case file"}), 400
+
+    try:
+        new_catalog = {}
+        for entry in case["files"]:
+            df = pd.read_json(io.StringIO(entry["dataframe_json"]), orient="records")
+            ndf = (pd.read_json(io.StringIO(entry["normalized_dataframe_json"]), orient="records")
+                   if entry.get("normalized_dataframe_json") else None)
+            new_catalog[entry["file_id"]] = {
+                "filename": entry["filename"], "sheet_name": entry["sheet_name"],
+                "exchange": entry["exchange"], "file_type": entry["file_type"],
+                "columns": entry["columns"], "row_count": entry["row_count"],
+                "dataframe": df, "suspect_id": entry["suspect_id"],
+                "normalized_dataframe": ndf, "missing_fields": entry["missing_fields"],
+            }
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to load case: {str(e)}"}), 500
+
+    # Loading a case replaces the current session entirely - a case file is a full snapshot,
+    # not something to merge with whatever's already open.
+    SUSPECTS.clear()
+    SUSPECTS.update(case["suspects"])
+    CATALOG.clear()
+    CATALOG.update(new_catalog)
+    EXCLUDED_ADDRESSES.clear()
+    EXCLUDED_ADDRESSES.update(case.get("excluded_addresses", {}))
+
+    return jsonify({
+        "success": True,
+        "suspect_count": len(SUSPECTS),
+        "file_count": len(CATALOG),
+        "saved_at": case.get("saved_at"),
+    })
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -1174,6 +1276,8 @@ HTML_PAGE = """
     header { margin-bottom: 24px; }
     header h1 { font-size: 26px; margin: 0 0 6px; font-weight: 600; }
     header p { color: var(--text-dim); margin: 0; font-size: 14px; }
+    .header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+    .case-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
     .panel {
         background: var(--bg-card); border: 1px solid var(--border);
@@ -1405,8 +1509,17 @@ HTML_PAGE = """
 
 <div class="container">
     <header>
-        <h1>CryptoLink</h1>
-        <p>Import Excel files received from exchanges. Only Deposit/Withdrawal sheets are kept.</p>
+        <div class="header-row">
+            <div>
+                <h1>CryptoLink</h1>
+                <p>Import Excel files received from exchanges. Only Deposit/Withdrawal sheets are kept.</p>
+            </div>
+            <div class="case-actions">
+                <button class="btn small" onclick="saveCase()">💾 Save case</button>
+                <button class="btn small" onclick="document.getElementById('caseFileInput').click()">📂 Load case</button>
+                <input type="file" id="caseFileInput" accept=".json" style="display:none;" onchange="loadCase(this.files[0])">
+            </div>
+        </div>
     </header>
 
     <div class="main-tabs">
@@ -2318,6 +2431,49 @@ function triggerExport(fmt) {
     }
 
     window.location.href = `/export/${fmt}${suspectsQueryParam()}`;
+}
+
+
+// ---------------------------------------------------------------------------
+// CASE SAVE / LOAD
+// ---------------------------------------------------------------------------
+
+function saveCase() {
+    window.location.href = "/case/export";
+}
+
+function loadCase(file) {
+    if (!file) return;
+    if (!confirm("Loading a case replaces everything currently open (suspects, files, hidden wallets) with the saved case. Continue?")) {
+        document.getElementById("caseFileInput").value = "";
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    fetch("/case/import", { method: "POST", body: formData })
+        .then(r => r.json().then(data => ({ ok: r.ok, data })))
+        .then(({ ok, data }) => {
+            document.getElementById("caseFileInput").value = "";
+            if (!ok || data.error) { showToast(data.error || "Failed to load case", true); return; }
+
+            activeSuspectId = "";
+            collapsedSuspects = {};
+            catalogData = {};
+            suspectFilterSelected = new Set();
+
+            fetch("/files").then(r => r.json()).then(files => {
+                files.forEach(item => { catalogData[item.id] = item; });
+                refreshSuspects();
+                updateDropzoneState();
+                showToast(`Case loaded: ${data.suspect_count} suspect(s), ${data.file_count} file(s)`, false);
+            });
+        })
+        .catch(err => {
+            document.getElementById("caseFileInput").value = "";
+            showToast("Network error loading case: " + err, true);
+        });
 }
 
 
