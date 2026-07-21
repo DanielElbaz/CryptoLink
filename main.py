@@ -43,6 +43,10 @@ CATALOG = {}    # file_id -> {..., "suspect_id": str, "dataframe": DataFrame}
 # hot wallet touched by unrelated users) and excluded from address-based cross-referencing
 # (Wallets/Transfers/Graph). Individual transactions through it still show in Amounts.
 EXCLUDED_ADDRESSES = {}
+# lower(address) -> {"address": original-case address, "note": free text}, e.g. "confirmed
+# via subpoena" or "known legit exchange wallet, not suspicious". Purely informational -
+# doesn't affect matching, filtering, or the graph.
+ADDRESS_NOTES = {}
 
 # ---------------------------------------------------------------------------
 # DETECTION
@@ -235,7 +239,7 @@ def index():
 
 @app.route("/suspects", methods=["GET"])
 def list_suspects():
-    return jsonify([{"id": sid, "name": s["name"]} for sid, s in SUSPECTS.items()])
+    return jsonify([{"id": sid, "name": s["name"], "note": s.get("note", "")} for sid, s in SUSPECTS.items()])
 
 
 @app.route("/suspects", methods=["POST"])
@@ -245,7 +249,7 @@ def create_suspect():
     if not name:
         return jsonify({"error": "Name required"}), 400
     sid = str(uuid.uuid4())
-    SUSPECTS[sid] = {"name": name}
+    SUSPECTS[sid] = {"name": name, "note": ""}
     return jsonify({"id": sid, "name": name})
 
 
@@ -255,6 +259,29 @@ def delete_suspect(suspect_id):
     to_remove = [fid for fid, f in CATALOG.items() if f["suspect_id"] == suspect_id]
     for fid in to_remove:
         del CATALOG[fid]
+    return jsonify({"success": True})
+
+
+@app.route("/suspects/<suspect_id>/note", methods=["POST"])
+def set_suspect_note(suspect_id):
+    if suspect_id not in SUSPECTS:
+        return jsonify({"error": "Suspect not found"}), 404
+    data = request.get_json()
+    SUSPECTS[suspect_id]["note"] = (data.get("note") or "").strip()
+    return jsonify({"success": True})
+
+
+@app.route("/addresses/note", methods=["POST"])
+def set_address_note():
+    data = request.get_json()
+    addr = (data.get("address") or "").strip()
+    note = (data.get("note") or "").strip()
+    if not addr:
+        return jsonify({"error": "Address required"}), 400
+    if note:
+        ADDRESS_NOTES[addr.lower()] = {"address": addr, "note": note}
+    else:
+        ADDRESS_NOTES.pop(addr.lower(), None)
     return jsonify({"success": True})
 
 
@@ -465,6 +492,7 @@ def compute_addresses_analysis(suspect_ids=None):
         distinct_suspects = {o["suspect_id"] for o in occurrences}
         results.append({
             "address": occurrences[0]["external_address"],
+            "note": ADDRESS_NOTES.get(addr_lower, {}).get("note", ""),
             "occurrence_count": len(occurrences),
             "distinct_accounts": len(distinct_combos),
             "is_cross_account": len(distinct_combos) > 1,
@@ -515,6 +543,7 @@ def list_excluded_addresses():
             "address": original,
             "occurrence_count": len(occurrences),
             "suspect_names": sorted({o["suspect_name"] for o in occurrences}),
+            "note": ADDRESS_NOTES.get(addr_lower, {}).get("note", ""),
         })
     result.sort(key=lambda x: x["address"].lower())
     return jsonify(result)
@@ -717,6 +746,13 @@ def analysis_transfers():
     return jsonify(compute_transfers_analysis(_parse_suspect_ids()))
 
 
+def _pdf_escape(text):
+    """reportlab's Paragraph parses its text as pseudo-XML (for <b>, etc.) - free-text notes
+    can contain &, <, > from the user, which would otherwise break rendering or get
+    misinterpreted as markup."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _fmt_amount_export(amount, currency):
     if amount is None:
         return "-"
@@ -740,13 +776,17 @@ def build_report_context(suspect_ids=None):
     """Gathers everything an export needs: the 3 analysis datasets plus
     metadata (generation time, suspects included). If suspect_ids is given,
     the report is scoped to only those suspects."""
-    if suspect_ids is not None:
-        names = sorted({s["name"] for sid, s in SUSPECTS.items() if sid in suspect_ids})
-    else:
-        names = sorted({s["name"] for s in SUSPECTS.values()})
+    scoped_suspects = ([s for sid, s in SUSPECTS.items() if sid in suspect_ids]
+                       if suspect_ids is not None else list(SUSPECTS.values()))
+    names = sorted({s["name"] for s in scoped_suspects})
+    suspect_notes = sorted(
+        ({"name": s["name"], "note": s["note"]} for s in scoped_suspects if s.get("note")),
+        key=lambda x: x["name"].lower()
+    )
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "suspect_names": names or ["(none)"],
+        "suspect_notes": suspect_notes,
         "addresses": compute_addresses_analysis(suspect_ids),
         "amounts": compute_amounts_analysis(suspect_ids),
         "transfers": compute_transfers_analysis(suspect_ids),
@@ -772,15 +812,22 @@ def export_xlsx(suspect_ids=None):
             cell.fill = header_fill
             cell.font = header_font
 
+    # --- Suspects sheet ---
+    ws0 = wb.active
+    ws0.title = "Suspects"
+    write_header(ws0, ["Name", "Note"])
+    for name in ctx["suspect_names"]:
+        note = next((n["note"] for n in ctx["suspect_notes"] if n["name"] == name), "")
+        ws0.append([name, note])
+
     # --- Wallets sheet (one row per occurrence, address repeated) ---
-    ws = wb.active
-    ws.title = "Wallets"
-    write_header(ws, ["Address", "Total Occurrences", "Distinct Accounts", "Different People",
+    ws = wb.create_sheet("Wallets")
+    write_header(ws, ["Address", "Note", "Total Occurrences", "Distinct Accounts", "Different People",
                        "Suspect", "Exchange", "Type", "Amount", "Currency", "Amount USD", "Date", "TXID"])
     for item in ctx["addresses"]:
         for o in item["occurrences"]:
             ws.append([
-                item["address"], item["occurrence_count"], item["distinct_accounts"],
+                item["address"], item["note"], item["occurrence_count"], item["distinct_accounts"],
                 "YES" if item["is_cross_suspect"] else "",
                 o["suspect_name"], o["exchange"], o["file_type"],
                 o["amount"], o["currency"], o["amount_usd"], _fmt_date_export(o["date"]), o["txid"],
@@ -844,6 +891,13 @@ def export_docx(suspect_ids=None):
     meta.add_run(f"Generated: {ctx['generated_at']}\n").italic = True
     meta.add_run(f"Suspects included: {', '.join(ctx['suspect_names'])}").italic = True
 
+    if ctx["suspect_notes"]:
+        doc.add_heading("Suspect notes", level=1)
+        for n in ctx["suspect_notes"]:
+            p = doc.add_paragraph()
+            p.add_run(n["name"] + ": ").bold = True
+            p.add_run(n["note"])
+
     # --- Wallets ---
     doc.add_heading("Wallets", level=1)
     doc.add_paragraph(f"{len(ctx['addresses'])} distinct address(es), sorted by frequency.")
@@ -861,6 +915,10 @@ def export_docx(suspect_ids=None):
             warn = p.add_run("  [SAME PERSON - MULTIPLE EXCHANGES]")
             warn.bold = True
             warn.font.color.rgb = RGBColor(0x1F, 0x5C, 0xA8)
+        if item["note"]:
+            note_p = doc.add_paragraph()
+            note_p.add_run("Note: ").italic = True
+            note_p.add_run(item["note"]).italic = True
 
         table = doc.add_table(rows=1, cols=6)
         table.style = "Light Grid Accent 1"
@@ -982,6 +1040,12 @@ def export_pdf(suspect_ids=None):
         Spacer(1, 16),
     ]
 
+    if ctx["suspect_notes"]:
+        elements.append(Paragraph("Suspect notes", styles["Heading1"]))
+        for n in ctx["suspect_notes"]:
+            elements.append(Paragraph(f"<b>{_pdf_escape(n['name'])}:</b> {_pdf_escape(n['note'])}", styles["Normal"]))
+        elements.append(Spacer(1, 16))
+
     def add_table(headers, rows, col_widths=None):
         data = [headers] + rows
         t = Table(data, colWidths=col_widths, repeatRows=1)
@@ -1003,14 +1067,14 @@ def export_pdf(suspect_ids=None):
     for item in ctx["addresses"]:
         for o in item["occurrences"]:
             wallet_rows.append([
-                item["address"][:40], str(item["occurrence_count"]),
+                item["address"][:40], (item["note"] or "-")[:30], str(item["occurrence_count"]),
                 "DIFF. PEOPLE" if item["is_cross_suspect"] else ("same person" if item["is_cross_account"] else ""),
                 o["suspect_name"], o["exchange"], o["file_type"],
                 _fmt_amount_export(o["amount"], o["currency"]), _fmt_date_export(o["date"]), (o["txid"] or "-")[:24],
             ])
     if wallet_rows:
         elements.append(add_table(
-            ["Address", "Occ.", "Shared", "Suspect", "Exchange", "Type", "Amount", "Date", "TXID"],
+            ["Address", "Note", "Occ.", "Shared", "Suspect", "Exchange", "Type", "Amount", "Date", "TXID"],
             wallet_rows
         ))
     elements.append(Spacer(1, 16))
@@ -1126,6 +1190,7 @@ def compute_graph_data(suspect_ids=None):
             "id": addr_id,
             "label": item["address"][:6] + "…" + item["address"][-4:] if len(item["address"]) > 12 else item["address"],
             "title": item["address"],
+            "note": item["note"],
             # Red for a wallet shared between different people, amber when it's the same
             # person reusing a wallet across their own exchange accounts - visually distinct
             # findings, not the same alert level.
@@ -1228,6 +1293,7 @@ def export_case():
         "saved_at": datetime.now().isoformat(),
         "suspects": SUSPECTS,
         "excluded_addresses": EXCLUDED_ADDRESSES,
+        "address_notes": ADDRESS_NOTES,
         "files": files,
     }
     buf = io.BytesIO(json.dumps(case, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -1275,6 +1341,8 @@ def import_case():
     CATALOG.update(new_catalog)
     EXCLUDED_ADDRESSES.clear()
     EXCLUDED_ADDRESSES.update(case.get("excluded_addresses", {}))
+    ADDRESS_NOTES.clear()
+    ADDRESS_NOTES.update(case.get("address_notes", {}))
 
     return jsonify({
         "success": True,
@@ -1376,6 +1444,19 @@ HTML_PAGE = """
     }
     .suspect-header .chevron { transition: transform 0.15s ease; color: var(--text-dim); }
     .suspect-header .chevron.collapsed { transform: rotate(-90deg); }
+
+    .suspect-note {
+        font-size: 12.5px; color: var(--text-dim); padding: 0 4px 10px; cursor: pointer;
+        white-space: pre-wrap; word-break: break-word;
+    }
+    .suspect-note:hover { color: var(--text); }
+    .suspect-note .note-placeholder { opacity: 0.6; }
+    .suspect-note textarea {
+        width: 100%; max-width: 480px; min-height: 60px; background: #101625; color: var(--text);
+        border: 1px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12.5px;
+        font-family: inherit; resize: vertical; cursor: text;
+    }
+    .note-actions { display: flex; gap: 8px; margin-top: 6px; }
 
     .table-wrap { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
@@ -1639,9 +1720,11 @@ const EXCHANGES = ["binance", "okx", "bybit", "redotpay", "matrix", "unknown"];
 const TYPE_LABELS = {"deposit": "Deposit", "withdrawal": "Withdrawal"};
 
 let suspects = {};       // id -> name
+let suspectNotes = {};   // id -> note text
 let catalogData = {};    // file id -> entry
 let activeSuspectId = "";
 let collapsedSuspects = {};
+let editingSuspectNote = null;  // suspect id currently showing its note editor, or null
 
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
@@ -1649,7 +1732,7 @@ const fileInput = document.getElementById("fileInput");
 function refreshSuspects() {
     fetch("/suspects").then(r => r.json()).then(list => {
         suspects = {};
-        list.forEach(s => suspects[s.id] = s.name);
+        list.forEach(s => { suspects[s.id] = s.name; suspectNotes[s.id] = s.note || ""; });
         const sel = document.getElementById("activeSuspectSelect");
         sel.innerHTML = '<option value="">-- No suspect selected --</option>';
         list.forEach(s => {
@@ -1770,6 +1853,48 @@ function showToast(msg, isWarn) {
     window._toastTimer = setTimeout(() => t.classList.remove("show"), 4200);
 }
 
+// Free-text note attached to a suspect (e.g. "confirmed via subpoena"). Click-to-edit
+// inline, no popup - consistent with how hiding a wallet works elsewhere in the app.
+function suspectNoteHtml(sid) {
+    const note = suspectNotes[sid] || "";
+    if (editingSuspectNote === sid) {
+        return `<div class="suspect-note" onclick="event.stopPropagation()">
+            <textarea id="noteInput-${sid}" placeholder="Add a note about this suspect...">${escapeHtml(note)}</textarea>
+            <div class="note-actions">
+                <button class="btn small" onclick="saveSuspectNote('${sid}')">Save</button>
+                <button class="btn small" onclick="cancelSuspectNoteEdit()">Cancel</button>
+            </div>
+        </div>`;
+    }
+    return `<div class="suspect-note" onclick="event.stopPropagation(); startSuspectNoteEdit('${sid}')">
+        ${note ? `📝 ${escapeHtml(note)}` : '<span class="note-placeholder">+ Add note</span>'}
+    </div>`;
+}
+
+function startSuspectNoteEdit(sid) {
+    editingSuspectNote = sid;
+    renderAll();
+    const ta = document.getElementById("noteInput-" + sid);
+    if (ta) ta.focus();
+}
+
+function cancelSuspectNoteEdit() {
+    editingSuspectNote = null;
+    renderAll();
+}
+
+function saveSuspectNote(sid) {
+    const note = document.getElementById("noteInput-" + sid).value.trim();
+    fetch(`/suspects/${sid}/note`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note })
+    }).then(() => {
+        suspectNotes[sid] = note;
+        editingSuspectNote = null;
+        renderAll();
+    });
+}
+
 function renderAll(highlightIds) {
     highlightIds = highlightIds || [];
     const container = document.getElementById("suspectBlocks");
@@ -1801,6 +1926,7 @@ function renderAll(highlightIds) {
                     <span class="count-badge">${ids.length} sheet(s) - ${exchangeCount} exchange(s)</span>
                 </h2>
             </div>
+            ${suspectNoteHtml(sid)}
             <div class="table-wrap" style="${collapsed ? 'display:none;' : ''}" id="tw-${sid}">
                 <table>
                     <thead>
@@ -2010,15 +2136,18 @@ function renderAddresses(container) {
     let html = `<div class="results-note">${filtered.length} of ${data.length} distinct address(es) shown, sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
     html += '<div class="table-wrap"><table><thead><tr><th>Address</th><th>Occurrences</th><th>Distinct accounts</th><th></th></tr></thead><tbody>';
     filtered.forEach((item, idx) => {
-        html += `<tr class="addr-row" onclick="toggleAddrDetail(${idx})">
-            <td>${addressCellHtml(item.address)}</td>
+        const esc = escapeHtml(item.address).replace(/'/g, "\\'");
+        const isExpanded = !!analysisSearchQuery || expandedAddresses.has(item.address);
+        html += `<tr class="addr-row" onclick="toggleAddrDetail('${esc}', ${idx})">
+            <td>${addressCellHtml(item.address)}${item.note ? ' <span title="Has a note" style="cursor:help;">📝</span>' : ""}</td>
             <td>${item.occurrence_count}</td>
             <td>${item.distinct_accounts}</td>
             <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
         </tr>
-        <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${analysisSearchQuery ? 'table-row' : 'none'};">
+        <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${isExpanded ? 'table-row' : 'none'};">
             <td colspan="4">
                 <div class="addr-detail-wrap">
+                    ${addressNoteHtml(item)}
                     <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
                     ${item.occurrences.map(o => `<tr>
                         <td>${escapeHtml(o.suspect_name)}</td>
@@ -2037,9 +2166,16 @@ function renderAddresses(container) {
     container.innerHTML = html;
 }
 
-function toggleAddrDetail(idx) {
+// Tracks which addresses are expanded by address (not row index, which shifts whenever the
+// list is filtered/re-sorted/re-rendered) so re-rendering after a note edit doesn't collapse
+// the row the user was just looking at.
+let expandedAddresses = new Set();
+
+function toggleAddrDetail(address, idx) {
+    if (expandedAddresses.has(address)) expandedAddresses.delete(address);
+    else expandedAddresses.add(address);
     const row = document.getElementById("addrDetail" + idx);
-    row.style.display = row.style.display === "none" ? "table-row" : "none";
+    row.style.display = expandedAddresses.has(address) ? "table-row" : "none";
 }
 
 // Address cell with copy/hide icons that only appear on hover (see .row-actions CSS).
@@ -2053,6 +2189,51 @@ function addressCellHtml(address, includeHide) {
             <button class="icon-btn" title="Copy address" onclick="event.stopPropagation(); copyAddress('${esc}')">📋</button>
             ${includeHide ? `<button class="icon-btn danger" title="Hide this wallet" onclick="event.stopPropagation(); hideWallet('${esc}')">🗑️</button>` : ""}
         </span>`;
+}
+
+// Free-text note attached to a wallet address (e.g. "known legit exchange wallet, not
+// suspicious"). Lives inside the address's expandable detail row - click-to-edit, no popup.
+let editingAddressNote = null;  // address currently showing its note editor, or null
+
+function addressNoteHtml(item) {
+    const esc = escapeHtml(item.address).replace(/'/g, "\\'");
+    if (editingAddressNote === item.address) {
+        return `<div class="suspect-note" onclick="event.stopPropagation()" style="padding:0 0 12px;">
+            <textarea id="addrNoteInput" placeholder="Add a note about this wallet...">${escapeHtml(item.note || "")}</textarea>
+            <div class="note-actions">
+                <button class="btn small" onclick="event.stopPropagation(); saveAddressNote('${esc}')">Save</button>
+                <button class="btn small" onclick="event.stopPropagation(); cancelAddressNoteEdit()">Cancel</button>
+            </div>
+        </div>`;
+    }
+    return `<div class="suspect-note" onclick="event.stopPropagation(); startAddressNoteEdit('${esc}')" style="padding:0 0 12px;">
+        ${item.note ? `📝 ${escapeHtml(item.note)}` : '<span class="note-placeholder">+ Add note</span>'}
+    </div>`;
+}
+
+function startAddressNoteEdit(address) {
+    editingAddressNote = address;
+    expandedAddresses.add(address);
+    renderAddresses(document.getElementById("analysisContent"));
+    const ta = document.getElementById("addrNoteInput");
+    if (ta) ta.focus();
+}
+
+function cancelAddressNoteEdit() {
+    editingAddressNote = null;
+    renderAddresses(document.getElementById("analysisContent"));
+}
+
+function saveAddressNote(address) {
+    const note = document.getElementById("addrNoteInput").value.trim();
+    fetch("/addresses/note", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, note })
+    }).then(() => {
+        editingAddressNote = null;
+        loadAddresses(document.getElementById("analysisContent"));
+        refreshHiddenWalletsSidebar();
+    });
 }
 
 // Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
@@ -2131,6 +2312,7 @@ function refreshHiddenWalletsSidebar() {
             <div class="hidden-wallet-item">
                 <div class="hidden-wallet-addr">${addressCellHtml(item.address, false)}</div>
                 <div class="hidden-wallet-meta">${item.occurrence_count} occurrence(s)${item.suspect_names.length ? " · " + escapeHtml(item.suspect_names.join(", ")) : ""}</div>
+                ${item.note ? `<div class="hidden-wallet-meta" style="color:var(--text-dim);">📝 ${escapeHtml(item.note)}</div>` : ""}
                 <button class="btn small" onclick="restoreWallet('${escapeHtml(item.address).replace(/'/g, "\\'")}')">Restore</button>
             </div>
         `).join("");
@@ -2286,6 +2468,7 @@ function loadGraph(container) {
         <div class="graph-canvas-wrap">
             <div id="graphCanvas"></div>
             <div id="graphNodeToolbar" class="node-toolbar">
+                <span class="icon-btn" id="graphNodeNoteIcon" style="display:none;cursor:help;">📝</span>
                 <button class="icon-btn" title="Copy address" onclick="copyAddress(document.getElementById('graphNodeToolbar').dataset.address)">📋</button>
                 <button class="icon-btn danger" title="Hide this wallet" onclick="hideWallet(document.getElementById('graphNodeToolbar').dataset.address)">🗑️</button>
             </div>
@@ -2346,6 +2529,9 @@ function loadGraph(container) {
             toolbar.style.top = (pos.y - 14) + "px";
             toolbar.style.display = "flex";
             toolbar.dataset.address = node.title;
+            const noteIcon = document.getElementById("graphNodeNoteIcon");
+            noteIcon.style.display = node.note ? "inline-block" : "none";
+            noteIcon.title = node.note || "";
         });
         graphNetworkInstance.on("blurNode", scheduleHideGraphToolbar);
         graphNetworkInstance.on("dragStart", () => { toolbar.style.display = "none"; });
