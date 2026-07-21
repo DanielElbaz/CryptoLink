@@ -1,5 +1,6 @@
 __pycache__/
 cryptolink_autosave.json
+cryptolink_known_wallets.json
 build/
 dist/
 *.spec
