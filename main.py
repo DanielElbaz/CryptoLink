@@ -1592,10 +1592,20 @@ HTML_PAGE = """
 <style>
     :root {
         --bg: #0f1420; --bg-card: #171d2e; --border: #2a3348;
-        --text: #e6e9f0; --text-dim: #8b93a7;
+        --text: #e6e9f0; --text-dim: #8b93a7; --btn-text: #e6e9f0;
         --accent: #4f8cff; --accent-dim: #2a4a8a;
         --success: #3ecf8e; --warning: #f5a623; --danger: #f0556b;
+        --input-bg: #101625; --hover-bg: #1c2438; --dropzone-hover-bg: #1a2236; --nested-bg: #10141f;
         --radius: 10px;
+    }
+    /* Same variables, light values - toggled via the 🌙/☀️ button (see toggleTheme()), which
+       stamps data-theme on <html> and remembers the choice in localStorage. */
+    :root[data-theme="light"] {
+        --bg: #f4f5f8; --bg-card: #ffffff; --border: #dde1e9;
+        --text: #1a1f2b; --text-dim: #656d7c; --btn-text: #ffffff;
+        --accent: #2451b8; --accent-dim: #3568d4;
+        --success: #1a9d63; --warning: #b06a05; --danger: #d1364f;
+        --input-bg: #ffffff; --hover-bg: #eef1f6; --dropzone-hover-bg: #eaf0ff; --nested-bg: #f7f8fb;
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
@@ -1620,7 +1630,7 @@ HTML_PAGE = """
 
     .suspect-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     select, input[type="text"] {
-        background: #101625; color: var(--text); border: 1px solid var(--border);
+        background: var(--input-bg); color: var(--text); border: 1px solid var(--border);
         border-radius: 6px; padding: 9px 12px; font-size: 14px;
     }
     select:focus, input[type="text"]:focus { outline: none; border-color: var(--accent); }
@@ -1631,7 +1641,7 @@ HTML_PAGE = """
     mark.search-hit { background: rgba(245,166,35,0.35); color: inherit; border-radius: 2px; padding: 0 1px; }
 
     .btn {
-        background: var(--accent-dim); color: var(--text); border: none;
+        background: var(--accent-dim); color: var(--btn-text); border: none;
         padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 13.5px;
     }
     .btn:hover { background: var(--accent); }
@@ -1645,7 +1655,7 @@ HTML_PAGE = """
         padding: 40px 24px; text-align: center; cursor: pointer;
         transition: all 0.15s ease; background: var(--bg-card);
     }
-    .dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: #1a2236; }
+    .dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: var(--dropzone-hover-bg); }
     .dropzone.disabled { opacity: 0.5; cursor: not-allowed; }
     .dropzone .icon { font-size: 30px; margin-bottom: 8px; }
     .dropzone .main-text { font-size: 14.5px; font-weight: 500; }
@@ -1683,7 +1693,7 @@ HTML_PAGE = """
     .suspect-note:hover { color: var(--text); }
     .suspect-note .note-placeholder { opacity: 0.6; }
     .suspect-note textarea {
-        width: 100%; max-width: 480px; min-height: 60px; background: #101625; color: var(--text);
+        width: 100%; max-width: 480px; min-height: 60px; background: var(--input-bg); color: var(--text);
         border: 1px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12.5px;
         font-family: inherit; resize: vertical; cursor: text;
     }
@@ -1694,7 +1704,7 @@ HTML_PAGE = """
     thead th { text-align: left; padding: 11px 14px; color: var(--text-dim); font-weight: 500; border-bottom: 1px solid var(--border); white-space: nowrap; }
     tbody td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
     tbody tr:last-child td { border-bottom: none; }
-    tbody tr:hover { background: #1c2438; }
+    tbody tr:hover { background: var(--hover-bg); }
     tbody tr.highlight { animation: flashHighlight 1.8s ease; }
     @keyframes flashHighlight { 0% { background: rgba(62,207,142,0.25); } 100% { background: transparent; } }
 
@@ -1766,7 +1776,7 @@ HTML_PAGE = """
     }
 
     .addr-row { cursor: pointer; }
-    .addr-detail-row td { background: #10141f; padding: 0; }
+    .addr-detail-row td { background: var(--nested-bg); padding: 0; }
     .addr-detail-wrap { padding: 10px 30px; }
     .addr-detail-wrap table { font-size: 12.5px; }
     .addr-mono { font-family: "SF Mono", Consolas, monospace; font-size: 12.5px; unicode-bidi: isolate; }
@@ -1791,7 +1801,7 @@ HTML_PAGE = """
     }
     .chain-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
     .chain-path { font-size: 14px; }
-    .chain-card .transfer-card { background: #10141f; margin-bottom: 0; }
+    .chain-card .transfer-card { background: var(--nested-bg); margin-bottom: 0; }
     .chain-link {
         text-align: center; font-size: 12px; color: var(--text-dim); padding: 10px 0;
     }
@@ -1858,11 +1868,16 @@ HTML_PAGE = """
         background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 13px;
         padding: 3px 5px; border-radius: 4px; line-height: 1;
     }
-    .icon-btn:hover { color: var(--text); background: #1c2438; }
+    .icon-btn:hover { color: var(--text); background: var(--hover-bg); }
     .icon-btn.danger:hover { color: var(--danger); background: rgba(240,85,107,0.12); }
 </style>
 </head>
 <body>
+<script>
+// Applied inline, before the rest of the page renders, so a saved "light" preference doesn't
+// flash dark for a frame first.
+document.documentElement.setAttribute("data-theme", localStorage.getItem("cryptolink-theme") || "dark");
+</script>
 
 <div class="container">
     <header>
@@ -1872,6 +1887,7 @@ HTML_PAGE = """
                 <p>Import Excel files received from exchanges. Only Deposit/Withdrawal sheets are kept.</p>
             </div>
             <div class="case-actions">
+                <button class="btn small" id="themeToggleBtn" onclick="toggleTheme()" title="Switch theme">🌙</button>
                 <button class="btn small" onclick="saveCase()">💾 Save case</button>
                 <button class="btn small" onclick="document.getElementById('caseFileInput').click()">📂 Load case</button>
                 <input type="file" id="caseFileInput" accept=".json" style="display:none;" onchange="loadCase(this.files[0])">
@@ -2797,10 +2813,11 @@ function loadGraph(container) {
 
         const nodes = new vis.DataSet(data.nodes);
         const edges = new vis.DataSet(data.edges);
+        const isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
 
         const options = {
             nodes: {
-                shape: "dot", size: 16, font: { color: "#e6e9f0", size: 12 },
+                shape: "dot", size: 16, font: { color: isLightTheme ? "#1a1f2b" : "#e6e9f0", size: 12 },
                 borderWidth: 2,
             },
             edges: {
@@ -3059,6 +3076,28 @@ function restoreAutosave() {
         .catch(err => showToast("Network error restoring autosave: " + err, true));
 }
 
+// ---------------------------------------------------------------------------
+// THEME
+// ---------------------------------------------------------------------------
+
+function applyThemeIcon() {
+    const theme = document.documentElement.getAttribute("data-theme");
+    document.getElementById("themeToggleBtn").textContent = theme === "light" ? "🌙" : "☀️";
+}
+
+function toggleTheme() {
+    const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("cryptolink-theme", next);
+    applyThemeIcon();
+    // Node label color is baked into the canvas by vis-network, not styled via CSS - only
+    // needs a redraw if the Graph tab is the one currently on screen.
+    if (currentMainTab === "analysis" && currentAnalysisTab === "graph") {
+        loadGraph(document.getElementById("analysisContent"));
+    }
+}
+
+applyThemeIcon();
 initApp();
 </script>
 
