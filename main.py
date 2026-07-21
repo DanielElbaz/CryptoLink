@@ -1814,21 +1814,26 @@ function fmtDate(iso) {
     return new Date(iso).toLocaleString();
 }
 
+// Truncated mono value (address or TXID) with a hover-reveal copy icon that always copies
+// the FULL untruncated value - the "…" in the middle was previously copyable as literal
+// text along with the two halves, corrupting anything pasted from it.
 function truncMono(value, keepStart, keepEnd) {
     keepStart = keepStart || 8;
     keepEnd = keepEnd || 6;
     if (!value) return `<span class="addr-mono">-</span>`;
     const v = String(value);
+    const copyBtn = `<span class="row-actions"><button class="icon-btn" title="Copy" onclick="event.stopPropagation(); copyAddress('${escapeHtml(v).replace(/'/g, "\\'")}')">📋</button></span>`;
+
     // Show the full value (highlighted) instead of truncating when it's what matched the
     // active search - truncation would otherwise hide the very match the user searched for.
     if (analysisSearchQuery && matchesSearch(v)) {
-        return `<span class="addr-mono">${highlightMatch(v)}</span>`;
+        return `<span class="addr-mono">${highlightMatch(v)}</span>${copyBtn}`;
     }
     if (v.length <= keepStart + keepEnd + 3) {
-        return `<span class="addr-mono">${escapeHtml(v)}</span>`;
+        return `<span class="addr-mono">${escapeHtml(v)}</span>${copyBtn}`;
     }
     const shortened = v.slice(0, keepStart) + "…" + v.slice(-keepEnd);
-    return `<span class="addr-mono" title="${escapeHtml(v)}">${escapeHtml(shortened)}</span>`;
+    return `<span class="addr-mono" title="${escapeHtml(v)}">${escapeHtml(shortened)}</span>${copyBtn}`;
 }
 
 function loadAddresses(container) {
