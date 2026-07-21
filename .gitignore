@@ -1,2 +1,5 @@
 __pycache__/
 cryptolink_autosave.json
+build/
+dist/
+*.spec

@@ -9,10 +9,12 @@ import pandas as pd
 import uuid
 import io
 import os
+import sys
 import json
 import time
 import atexit
 import threading
+import webbrowser
 import traceback
 from datetime import datetime
 from docx import Document
@@ -25,6 +27,24 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSON responses
 
+
+def _bundled_resource_path(relative_path):
+    """Path to a read-only resource bundled with the app (e.g. static/vis-network.min.js).
+    When frozen into a standalone .exe by PyInstaller, such files are unpacked into a
+    temporary directory at runtime (sys._MEIPASS) rather than living next to the script."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def _persistent_data_dir():
+    """Directory for files that must survive between runs (the autosave). When frozen,
+    sys._MEIPASS (used above for bundled resources) is wiped as soon as the exe exits, so
+    anything written there would vanish - this instead resolves next to the .exe itself."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # The Graph tab's vis-network library is embedded directly into the page (see index()
 # below) instead of loaded from a CDN or a separate /static request - this used to pull
 # from unpkg.com at runtime, which silently breaks the whole tab on any offline/restricted
@@ -32,7 +52,7 @@ app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSO
 # Missing file (e.g. main.py was copied without its static/ folder) degrades to a disabled
 # Graph tab instead of crashing the whole app on startup.
 try:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vis-network.min.js"), encoding="utf-8") as _f:
+    with open(_bundled_resource_path(os.path.join("static", "vis-network.min.js")), encoding="utf-8") as _f:
         VIS_NETWORK_JS = _f.read()
 except FileNotFoundError:
     print("WARNING: static/vis-network.min.js not found - the Graph tab will be disabled. "
@@ -1520,7 +1540,7 @@ def import_case():
 # close loses at most a couple of minutes of work instead of everything since the last manual
 # "Save case". Purely a local safety net - it never uploads or sends this anywhere.
 
-AUTOSAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptolink_autosave.json")
+AUTOSAVE_PATH = os.path.join(_persistent_data_dir(), "cryptolink_autosave.json")
 AUTOSAVE_INTERVAL_SECONDS = 120
 
 
@@ -3149,10 +3169,19 @@ if __name__ == "__main__":
     print("CryptoLink starting.")
     print("Open your browser at: http://127.0.0.1:5000")
     print("=" * 50)
+
+    # No reloader/debugger once packaged as a standalone .exe by PyInstaller - there's no
+    # source file for it to watch for changes to, and the reloader's re-exec trick doesn't
+    # play well with a frozen executable.
+    is_frozen = getattr(sys, "frozen", False)
+    use_debug = not is_frozen
+
     # debug=True runs Flask under a reloader, which re-executes this whole block in a child
-    # process - only start the background thread there (WERKZEUG_RUN_MAIN=="true"), not in
-    # the parent watcher process too, or every autosave would run twice.
-    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    # process - only start the background thread/browser-open there (WERKZEUG_RUN_MAIN=="true"),
+    # not in the parent watcher process too, or everything would run twice.
+    if not use_debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_autosave_thread()
         atexit.register(_write_autosave)  # best-effort final save on a clean Ctrl+C/exit
-    app.run(debug=True, port=5000)
+        threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+
+    app.run(debug=use_debug, port=5000)
