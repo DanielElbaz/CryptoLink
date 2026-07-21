@@ -1808,6 +1808,15 @@ HTML_PAGE = """
 
     .results-note { font-size: 12.5px; color: var(--text-dim); margin-bottom: 12px; }
 
+    .person-filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .person-filter-row .filter-label { font-size: 12.5px; color: var(--text-dim); margin-right: 2px; }
+    .filter-chip {
+        background: var(--bg-card); color: var(--text-dim); border: 1px solid var(--border);
+        padding: 6px 14px; border-radius: 20px; font-size: 12.5px; cursor: pointer;
+    }
+    .filter-chip:hover { color: var(--text); border-color: var(--accent); }
+    .filter-chip.active { background: var(--accent-dim); color: var(--btn-text); border-color: var(--accent-dim); }
+
     .export-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
     .export-label { font-size: 12.5px; color: var(--text-dim); margin-right: 4px; }
     a.btn { text-decoration: none; display: inline-block; }
@@ -2504,6 +2513,20 @@ function saveAddressNote(address) {
 let analysisSearchQuery = "";
 let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null, cachedChains = null;
 
+// Transfers tab: same person / different people filter, applied client-side on top of the
+// search filter (no re-fetch needed - the choice doesn't change what the server already sent).
+let transferPersonFilter = "all";
+
+function personFilterChip(value, label) {
+    const active = transferPersonFilter === value ? " active" : "";
+    return `<button class="filter-chip${active}" onclick="setTransferPersonFilter('${value}')">${escapeHtml(label)}</button>`;
+}
+
+function setTransferPersonFilter(value) {
+    transferPersonFilter = value;
+    renderTransfers(document.getElementById("analysisContent"));
+}
+
 function matchesSearch(text) {
     if (!analysisSearchQuery) return true;
     return (text || "").toLowerCase().includes(analysisSearchQuery);
@@ -2734,21 +2757,37 @@ function renderTransfers(container) {
         return;
     }
 
-    const matched = allMatched.filter(p => matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid));
+    const searchMatched = allMatched.filter(p => matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid));
     const unmatched = allUnmatched.filter(u => matchesSearch(u.address) || matchesSearch(u.txid));
+    const diffPeopleCount = searchMatched.filter(p => !p.same_suspect).length;
+    const samePersonCount = searchMatched.length - diffPeopleCount;
+
+    const matched = searchMatched.filter(p =>
+        transferPersonFilter === "all" ||
+        (transferPersonFilter === "same" && p.same_suspect) ||
+        (transferPersonFilter === "different" && !p.same_suspect)
+    );
+
+    let html = `<div class="person-filter-row">
+        <span class="filter-label">Show:</span>
+        ${personFilterChip("all", `All (${searchMatched.length})`)}
+        ${personFilterChip("same", `Same person (${samePersonCount})`)}
+        ${personFilterChip("different", `Different people (${diffPeopleCount})`)}
+    </div>`;
+
     if (!matched.length && !unmatched.length) {
-        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        html += analysisSearchQuery
+            ? `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`
+            : '<div class="analysis-empty">No transfer matches this filter.</div>';
+        container.innerHTML = html;
         return;
     }
 
-    const diffPeopleCount = matched.filter(p => !p.same_suspect).length;
-    const samePersonCount = matched.length - diffPeopleCount;
     const txidCount = matched.filter(p => p.match_type === "txid").length;
 
-    let html = `<div class="results-note">
-        ${matched.length}${analysisSearchQuery ? ` of ${allMatched.length}` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
-        ${matched.length - txidCount} inferred from a shared address. <b>${samePersonCount}</b> between wallets of the <b>same person</b>,
-        <b>${diffPeopleCount}</b> between <b>two different people</b>.
+    html += `<div class="results-note">
+        ${matched.length}${(analysisSearchQuery || transferPersonFilter !== "all") ? ` of ${allMatched.length}` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
+        ${matched.length - txidCount} inferred from a shared address.
         ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
     </div>`;
 
