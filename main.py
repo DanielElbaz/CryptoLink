@@ -9,10 +9,12 @@ import pandas as pd
 import uuid
 import io
 import os
+import sys
 import json
 import time
 import atexit
 import threading
+import webbrowser
 import traceback
 from datetime import datetime
 from docx import Document
@@ -25,6 +27,24 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSON responses
 
+
+def _bundled_resource_path(relative_path):
+    """Path to a read-only resource bundled with the app (e.g. static/vis-network.min.js).
+    When frozen into a standalone .exe by PyInstaller, such files are unpacked into a
+    temporary directory at runtime (sys._MEIPASS) rather than living next to the script."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def _persistent_data_dir():
+    """Directory for files that must survive between runs (the autosave). When frozen,
+    sys._MEIPASS (used above for bundled resources) is wiped as soon as the exe exits, so
+    anything written there would vanish - this instead resolves next to the .exe itself."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # The Graph tab's vis-network library is embedded directly into the page (see index()
 # below) instead of loaded from a CDN or a separate /static request - this used to pull
 # from unpkg.com at runtime, which silently breaks the whole tab on any offline/restricted
@@ -32,7 +52,7 @@ app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSO
 # Missing file (e.g. main.py was copied without its static/ folder) degrades to a disabled
 # Graph tab instead of crashing the whole app on startup.
 try:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vis-network.min.js"), encoding="utf-8") as _f:
+    with open(_bundled_resource_path(os.path.join("static", "vis-network.min.js")), encoding="utf-8") as _f:
         VIS_NETWORK_JS = _f.read()
 except FileNotFoundError:
     print("WARNING: static/vis-network.min.js not found - the Graph tab will be disabled. "
@@ -50,6 +70,15 @@ EXCLUDED_ADDRESSES = {}
 # via subpoena" or "known legit exchange wallet, not suspicious". Purely informational -
 # doesn't affect matching, filtering, or the graph.
 ADDRESS_NOTES = {}
+
+# lower(address) -> {"address": original-case address, "sightings": [{suspect_name,
+# case_label, exchanges, occurrence_count, first_seen, last_seen, added_at}, ...]}.
+# A persistent, growing ledger of every wallet ever committed from a finished
+# investigation - unlike everything else above, it survives "Load case" (a case swaps out
+# the working set; this is knowledge carried between cases). Populated only by the explicit
+# "Add wallets to database" action, never automatically, so it doesn't fill up with
+# still-unverified data from a case in progress.
+KNOWN_WALLETS = {}
 
 # ---------------------------------------------------------------------------
 # DETECTION
@@ -496,6 +525,10 @@ def compute_addresses_analysis(suspect_ids=None):
         results.append({
             "address": occurrences[0]["external_address"],
             "note": ADDRESS_NOTES.get(addr_lower, {}).get("note", ""),
+            # Sightings of this address from previously committed cases (see
+            # /known_wallets/commit) - a wallet with almost no data in the current case can
+            # still surface a match against everything ever investigated before.
+            "known_sightings": KNOWN_WALLETS.get(addr_lower, {}).get("sightings", []),
             "occurrence_count": len(occurrences),
             "distinct_accounts": len(distinct_combos),
             "is_cross_account": len(distinct_combos) > 1,
@@ -906,12 +939,13 @@ def export_xlsx(suspect_ids=None):
 
     # --- Wallets sheet (one row per occurrence, address repeated) ---
     ws = wb.create_sheet("Wallets")
-    write_header(ws, ["Address", "Note", "Total Occurrences", "Distinct Accounts", "Different People",
+    write_header(ws, ["Address", "Note", "Seen In Other Cases", "Total Occurrences", "Distinct Accounts", "Different People",
                        "Suspect", "Exchange", "Type", "Amount", "Currency", "Amount USD", "Date", "TXID"])
     for item in ctx["addresses"]:
+        known_summary = "; ".join(f"{s['case_label']} ({s['suspect_name']})" for s in item["known_sightings"])
         for o in item["occurrences"]:
             ws.append([
-                item["address"], item["note"], item["occurrence_count"], item["distinct_accounts"],
+                item["address"], item["note"], known_summary, item["occurrence_count"], item["distinct_accounts"],
                 "YES" if item["is_cross_suspect"] else "",
                 o["suspect_name"], o["exchange"], o["file_type"],
                 o["amount"], o["currency"], o["amount_usd"], _fmt_date_export(o["date"]), o["txid"],
@@ -1016,6 +1050,12 @@ def export_docx(suspect_ids=None):
             note_p = doc.add_paragraph()
             note_p.add_run("Note: ").italic = True
             note_p.add_run(item["note"]).italic = True
+        if item["known_sightings"]:
+            known_p = doc.add_paragraph()
+            tag = known_p.add_run(f"👁 Seen in {len(item['known_sightings'])} previous case(s): ")
+            tag.bold = True
+            tag.font.color.rgb = RGBColor(0x7C, 0x3A, 0xED)
+            known_p.add_run("; ".join(f"{s['case_label']} ({s['suspect_name']})" for s in item["known_sightings"]))
 
         table = doc.add_table(rows=1, cols=6)
         table.style = "Light Grid Accent 1"
@@ -1189,16 +1229,17 @@ def export_pdf(suspect_ids=None):
     elements.append(Spacer(1, 6))
     wallet_rows = []
     for item in ctx["addresses"]:
+        known = "; ".join(f"{s['case_label']}" for s in item["known_sightings"])[:30] or "-"
         for o in item["occurrences"]:
             wallet_rows.append([
-                item["address"][:40], (item["note"] or "-")[:30], str(item["occurrence_count"]),
+                item["address"][:40], (item["note"] or "-")[:30], known, str(item["occurrence_count"]),
                 "DIFF. PEOPLE" if item["is_cross_suspect"] else ("same person" if item["is_cross_account"] else ""),
                 o["suspect_name"], o["exchange"], o["file_type"],
                 _fmt_amount_export(o["amount"], o["currency"]), _fmt_date_export(o["date"]), (o["txid"] or "-")[:24],
             ])
     if wallet_rows:
         elements.append(add_table(
-            ["Address", "Note", "Occ.", "Shared", "Suspect", "Exchange", "Type", "Amount", "Date", "TXID"],
+            ["Address", "Note", "Seen Elsewhere", "Occ.", "Shared", "Suspect", "Exchange", "Type", "Amount", "Date", "TXID"],
             wallet_rows
         ))
     elements.append(Spacer(1, 16))
@@ -1520,7 +1561,7 @@ def import_case():
 # close loses at most a couple of minutes of work instead of everything since the last manual
 # "Save case". Purely a local safety net - it never uploads or sends this anywhere.
 
-AUTOSAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptolink_autosave.json")
+AUTOSAVE_PATH = os.path.join(_persistent_data_dir(), "cryptolink_autosave.json")
 AUTOSAVE_INTERVAL_SECONDS = 120
 
 
@@ -1575,6 +1616,77 @@ def restore_autosave():
         "file_count": len(CATALOG),
         "saved_at": case.get("saved_at"),
     })
+
+
+# ---------------------------------------------------------------------------
+# KNOWN WALLETS (cross-case ledger)
+# ---------------------------------------------------------------------------
+# Grows across every investigation, not just the one currently open - "Load case" replaces
+# the working set (suspects/files/notes) but never touches this. Loaded once at startup and
+# saved immediately after each commit (commits are rare, deliberate actions, not worth a
+# background thread like the autosave).
+
+KNOWN_WALLETS_PATH = os.path.join(_persistent_data_dir(), "cryptolink_known_wallets.json")
+
+
+def _load_known_wallets():
+    if not os.path.exists(KNOWN_WALLETS_PATH):
+        return
+    try:
+        with open(KNOWN_WALLETS_PATH, encoding="utf-8") as f:
+            KNOWN_WALLETS.update(json.load(f))
+    except Exception:
+        traceback.print_exc()
+
+
+def _save_known_wallets():
+    tmp_path = KNOWN_WALLETS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(KNOWN_WALLETS, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, KNOWN_WALLETS_PATH)
+
+
+@app.route("/known_wallets/commit", methods=["POST"])
+def commit_known_wallets():
+    """Snapshots every wallet in the CURRENT session (all suspects, hidden wallets already
+    excluded by compute_addresses_analysis) into the permanent cross-case ledger, tagged with
+    a case label so a future match can say where/who it was seen with."""
+    data = request.get_json() or {}
+    case_label = (data.get("case_label") or "").strip() or datetime.now().strftime("Case %Y-%m-%d %H:%M")
+    added_at = datetime.now().isoformat()
+
+    addresses = compute_addresses_analysis(None)
+    sighting_count = 0
+    for item in addresses:
+        addr_lower = item["address"].lower()
+        entry = KNOWN_WALLETS.setdefault(addr_lower, {"address": item["address"], "sightings": []})
+
+        by_suspect = {}
+        for o in item["occurrences"]:
+            agg = by_suspect.setdefault(o["suspect_name"], {"exchanges": set(), "count": 0, "dates": []})
+            agg["exchanges"].add(o["exchange"])
+            agg["count"] += 1
+            if o["date"]:
+                agg["dates"].append(o["date"])
+
+        for suspect_name, agg in by_suspect.items():
+            entry["sightings"].append({
+                "suspect_name": suspect_name, "case_label": case_label,
+                "exchanges": sorted(agg["exchanges"]), "occurrence_count": agg["count"],
+                "first_seen": min(agg["dates"]) if agg["dates"] else None,
+                "last_seen": max(agg["dates"]) if agg["dates"] else None,
+                "added_at": added_at,
+            })
+            sighting_count += 1
+
+    _save_known_wallets()
+    return jsonify({
+        "success": True, "case_label": case_label,
+        "wallet_count": len(addresses), "sighting_count": sighting_count,
+    })
+
+
+_load_known_wallets()
 
 
 # ---------------------------------------------------------------------------
@@ -1774,6 +1886,17 @@ HTML_PAGE = """
         display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
         font-weight: 700; background: rgba(245,166,35,0.18); color: var(--warning); margin-left: 8px;
     }
+    .known-elsewhere-badge {
+        display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
+        font-weight: 700; background: rgba(139,92,246,0.18); color: #a78bfa; margin-left: 8px; cursor: pointer;
+    }
+    .known-elsewhere-badge:hover { background: rgba(139,92,246,0.3); }
+    .known-sightings-box {
+        background: rgba(139,92,246,0.08); border: 1px solid rgba(139,92,246,0.3);
+        border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+    }
+    .known-sightings-title { font-size: 12px; font-weight: 600; color: #a78bfa; margin-bottom: 8px; }
+    .known-sightings-box table { font-size: 12px; }
 
     .addr-row { cursor: pointer; }
     .addr-detail-row td { background: var(--nested-bg); padding: 0; }
@@ -1944,6 +2067,7 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                 <button class="btn small" onclick="triggerExport('xlsx')">Excel (.xlsx)</button>
                 <button class="btn small" onclick="triggerExport('pdf')">PDF</button>
                 <button class="btn small" id="suspectFilterToggleBtn" onclick="toggleSuspectFilterPanel()">Filter suspects ▾</button>
+                <button class="btn small" id="knownWalletsToggleBtn" onclick="toggleKnownWalletsPanel()">📚 Add wallets to database</button>
             </div>
             <div id="suspectFilterPanel" class="suspect-filter-panel" style="display:none;">
                 <div class="suspect-filter-actions">
@@ -1951,6 +2075,17 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                     <button class="btn small" onclick="setAllSuspectFilter(false)">Select none</button>
                 </div>
                 <div id="suspectFilterList" class="suspect-filter-list"></div>
+            </div>
+            <div id="knownWalletsPanel" class="suspect-filter-panel" style="display:none;">
+                <p style="margin:0 0 10px;font-size:12.5px;color:var(--text-dim);">
+                    Saves every wallet in the current session to a permanent cross-case database, so a future
+                    investigation with little data of its own can still match against it. Give this case a label
+                    to remember it by.
+                </p>
+                <div class="suspect-filter-actions">
+                    <input type="text" id="knownWalletsLabel" placeholder="e.g. Q1 2026 fraud case" style="flex:1;">
+                    <button class="btn small" onclick="commitKnownWallets()">Add</button>
+                </div>
             </div>
         </div>
         <div class="analysis-layout">
@@ -2410,16 +2545,32 @@ function renderAddresses(container) {
     filtered.forEach((item, idx) => {
         const esc = escapeHtml(item.address).replace(/'/g, "\\'");
         const isExpanded = !!analysisSearchQuery || expandedAddresses.has(item.address);
+        const sightings = item.known_sightings || [];
         html += `<tr class="addr-row" onclick="toggleAddrDetail('${esc}', ${idx})">
             <td>${addressCellHtml(item.address)}${item.note ? ' <span title="Has a note" style="cursor:help;">📝</span>' : ""}</td>
             <td>${item.occurrence_count}</td>
             <td>${item.distinct_accounts}</td>
-            <td>${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}</td>
+            <td>
+                ${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}
+                ${sightings.length ? `<span class="known-elsewhere-badge" onclick="event.stopPropagation(); toggleAddrDetail('${esc}', ${idx})">👁 SEEN ELSEWHERE (${sightings.length})</span>` : ""}
+            </td>
         </tr>
         <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${isExpanded ? 'table-row' : 'none'};">
             <td colspan="4">
                 <div class="addr-detail-wrap">
                     ${addressNoteHtml(item)}
+                    ${sightings.length ? `<div class="known-sightings-box">
+                        <div class="known-sightings-title">👁 Seen in ${sightings.length} previous investigation(s)</div>
+                        <table><thead><tr><th>Case</th><th>Suspect</th><th>Exchange(s)</th><th>Occurrences</th><th>Last seen</th></tr></thead><tbody>
+                        ${sightings.map(s => `<tr>
+                            <td>${escapeHtml(s.case_label)}</td>
+                            <td>${escapeHtml(s.suspect_name)}</td>
+                            <td>${escapeHtml((s.exchanges || []).join(", "))}</td>
+                            <td>${s.occurrence_count}</td>
+                            <td>${fmtDate(s.last_seen)}</td>
+                        </tr>`).join("")}
+                        </tbody></table>
+                    </div>` : ""}
                     <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
                     ${item.occurrences.map(o => `<tr>
                         <td>${escapeHtml(o.suspect_name)}</td>
@@ -2963,6 +3114,25 @@ function toggleSuspectFilterPanel() {
     if (isHidden) renderSuspectFilterList();
 }
 
+function toggleKnownWalletsPanel() {
+    const panel = document.getElementById("knownWalletsPanel");
+    panel.style.display = panel.style.display === "none" ? "block" : "none";
+}
+
+function commitKnownWallets() {
+    const case_label = document.getElementById("knownWalletsLabel").value.trim();
+    fetch("/known_wallets/commit", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ case_label })
+    }).then(r => r.json()).then(data => {
+        if (data.error) { showToast(data.error, true); return; }
+        document.getElementById("knownWalletsLabel").value = "";
+        document.getElementById("knownWalletsPanel").style.display = "none";
+        showToast(`Added ${data.wallet_count} wallet(s) to the database as "${data.case_label}"`, false);
+        if (currentMainTab === "analysis" && currentAnalysisTab === "addresses") loadAddresses(document.getElementById("analysisContent"));
+    }).catch(err => showToast("Network error: " + err, true));
+}
+
 function renderSuspectFilterList() {
     const list = document.getElementById("suspectFilterList");
     const ids = Object.keys(suspects);
@@ -3149,10 +3319,19 @@ if __name__ == "__main__":
     print("CryptoLink starting.")
     print("Open your browser at: http://127.0.0.1:5000")
     print("=" * 50)
+
+    # No reloader/debugger once packaged as a standalone .exe by PyInstaller - there's no
+    # source file for it to watch for changes to, and the reloader's re-exec trick doesn't
+    # play well with a frozen executable.
+    is_frozen = getattr(sys, "frozen", False)
+    use_debug = not is_frozen
+
     # debug=True runs Flask under a reloader, which re-executes this whole block in a child
-    # process - only start the background thread there (WERKZEUG_RUN_MAIN=="true"), not in
-    # the parent watcher process too, or every autosave would run twice.
-    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    # process - only start the background thread/browser-open there (WERKZEUG_RUN_MAIN=="true"),
+    # not in the parent watcher process too, or everything would run twice.
+    if not use_debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_autosave_thread()
         atexit.register(_write_autosave)  # best-effort final save on a clean Ctrl+C/exit
-    app.run(debug=True, port=5000)
+        threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+
+    app.run(debug=use_debug, port=5000)

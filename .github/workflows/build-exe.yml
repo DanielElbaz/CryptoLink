@@ -1,0 +1,35 @@
+name: Build Windows executable
+
+on:
+  push:
+    paths:
+      - 'main.py'
+      - 'static/**'
+      - 'requirements.txt'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build CryptoLink.exe
+        run: |
+          pyinstaller --onefile --name CryptoLink --add-data "static;static" --exclude-module cryptography main.py
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: CryptoLink-windows-exe
+          path: dist/CryptoLink.exe
