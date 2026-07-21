@@ -746,6 +746,86 @@ def analysis_transfers():
     return jsonify(compute_transfers_analysis(_parse_suspect_ids()))
 
 
+# Same reasoning as ADDRESS_MATCH_MAX_GAP_HOURS: chaining two already-detected transfers is
+# itself a heuristic (the same person moving on to their next transaction), so it gets its
+# own gate rather than being assumed indefinitely.
+CHAIN_MAX_HOP_GAP_HOURS = 7 * 24         # max 7 days between one hop's deposit and the next hop's withdrawal
+CHAIN_AMOUNT_OVERSHOOT_TOLERANCE = 0.05  # the outgoing hop can't exceed the incoming one by more than 5% (fee/rounding slack)
+CHAIN_MAX_DEPTH = 12                     # hops per chain - guards against runaway recursion on dense data
+CHAIN_MAX_RESULTS = 500                  # total chains returned - same purpose
+
+
+def _can_chain_hop(p1, p2):
+    """Whether transfer p2 plausibly continues transfer p1 - p1's recipient goes on to be
+    p2's sender, soon enough after and (when a USD value is known on both sides) without
+    sending out more than they'd just received. Not proof of anything, same spirit as the
+    address-match heuristic: a trail worth a human's attention, not a certainty."""
+    d, w = p1["deposit"], p2["withdrawal"]
+    if d["suspect_id"] != w["suspect_id"]:
+        return False
+    gap_hours = (datetime.fromisoformat(w["date"]) - datetime.fromisoformat(d["date"])).total_seconds() / 3600
+    if gap_hours < 0 or gap_hours > CHAIN_MAX_HOP_GAP_HOURS:
+        return False
+    d_usd, w_usd = d.get("amount_usd"), w.get("amount_usd")
+    if d_usd and w_usd and w_usd > d_usd * (1 + CHAIN_AMOUNT_OVERSHOOT_TOLERANCE):
+        return False
+    return True
+
+
+def compute_transfer_chains(suspect_ids=None):
+    """Links already-detected 1-hop transfers end-to-end into full A -> B -> C -> ... paths:
+    money someone received in one transfer, then went on to send in another, shortly after.
+    On its own, compute_transfers_analysis only shows isolated 2-party hops - this traces how
+    far a trail of money actually goes instead of leaving the reader to connect the dots
+    between separate cards by hand.
+
+    Chains fork and join rather than being forced into single linear paths: a transfer can
+    have more than one plausible continuation (money getting split between two recipients) or
+    predecessor (two deposits both funding one later withdrawal), so the same hop can appear
+    in multiple returned chains. Only maximal chains are returned (at least 2 hops, and not a
+    sub-path of a longer chain already in the results).
+    """
+    transfers = compute_transfers_analysis(suspect_ids)["matched"]
+    n = len(transfers)
+
+    next_map = [[] for _ in range(n)]
+    prev_has_any = [False] * n
+    for i in range(n):
+        for j in range(n):
+            if i != j and _can_chain_hop(transfers[i], transfers[j]):
+                next_map[i].append(j)
+                prev_has_any[j] = True
+
+    chains = []
+    starts = [i for i in range(n) if next_map[i] and not prev_has_any[i]]
+
+    def walk(path, visited):
+        if len(chains) >= CHAIN_MAX_RESULTS:
+            return
+        i = path[-1]
+        can_extend = len(path) < CHAIN_MAX_DEPTH
+        extended = False
+        if can_extend:
+            for j in next_map[i]:
+                if j in visited:
+                    continue  # guards against a cycle, shouldn't happen given the date ordering above
+                extended = True
+                walk(path + [j], visited | {j})
+        if not extended and len(path) > 1:
+            chains.append([transfers[k] for k in path])
+
+    for s in starts:
+        walk([s], {s})
+
+    chains.sort(key=lambda c: len(c), reverse=True)
+    return chains
+
+
+@app.route("/analysis/chains")
+def analysis_chains():
+    return jsonify(compute_transfer_chains(_parse_suspect_ids()))
+
+
 def _pdf_escape(text):
     """reportlab's Paragraph parses its text as pseudo-XML (for <b>, etc.) - free-text notes
     can contain &, <, > from the user, which would otherwise break rendering or get
@@ -790,6 +870,7 @@ def build_report_context(suspect_ids=None):
         "addresses": compute_addresses_analysis(suspect_ids),
         "amounts": compute_amounts_analysis(suspect_ids),
         "transfers": compute_transfers_analysis(suspect_ids),
+        "chains": compute_transfer_chains(suspect_ids),
     }
 
 
@@ -866,6 +947,19 @@ def export_xlsx(suspect_ids=None):
             u["address"], u["direction"], u["suspect_name"], u["exchange"],
             u["amount"], u["currency"], _fmt_date_export(u["date"]), u["txid"],
         ])
+
+    # --- Chains sheet (one row per hop, chain number repeated) ---
+    ws5 = wb.create_sheet("Chains")
+    write_header(ws5, ["Chain #", "Hop #", "Match Type", "From Suspect", "From Exchange", "Amount",
+                        "Date", "To Suspect", "To Exchange", "Amount", "Date", "Gap (hours)"])
+    for chain_num, chain in enumerate(ctx["chains"], start=1):
+        for hop_num, p in enumerate(chain, start=1):
+            w, d = p["withdrawal"], p["deposit"]
+            ws5.append([
+                chain_num, hop_num, "TXID" if p["match_type"] == "txid" else "Address",
+                w["suspect_name"], w["exchange"], w["amount"], _fmt_date_export(w["date"]),
+                d["suspect_name"], d["exchange"], d["amount"], _fmt_date_export(d["date"]), p["gap_hours"],
+            ])
 
     for ws_ in wb.worksheets:
         for col in ws_.columns:
@@ -1016,6 +1110,33 @@ def export_docx(suspect_ids=None):
             row[4].text = _fmt_date_export(u["date"])
             row[5].text = u["address"]
 
+    # --- Chains ---
+    if ctx["chains"]:
+        doc.add_heading("Chains", level=1)
+        doc.add_paragraph(
+            f"{len(ctx['chains'])} multi-hop chain(s) - each links 2+ already-detected "
+            f"transfers where the same person received money in one, then sent it on in "
+            f"another shortly after. Longest first."
+        )
+        for i, chain in enumerate(ctx["chains"], start=1):
+            path = " -> ".join(p["withdrawal"]["suspect_name"] for p in chain) + " -> " + chain[-1]["deposit"]["suspect_name"]
+            doc.add_paragraph(f"Chain {i}: {path} ({len(chain)} hops)").runs[0].bold = True
+            table = doc.add_table(rows=1, cols=6)
+            table.style = "Light Grid Accent 1"
+            hdr = table.rows[0].cells
+            for j, h in enumerate(["Hop", "Match", "From", "Amount", "To", "Amount"]):
+                hdr[j].text = h
+            for hop_num, p in enumerate(chain, start=1):
+                w, d = p["withdrawal"], p["deposit"]
+                row = table.add_row().cells
+                row[0].text = str(hop_num)
+                row[1].text = "TXID" if p["match_type"] == "txid" else "Address"
+                row[2].text = f"{w['suspect_name']} ({w['exchange']})"
+                row[3].text = _fmt_amount_export(w["amount"], w["currency"])
+                row[4].text = f"{d['suspect_name']} ({d['exchange']})"
+                row[5].text = _fmt_amount_export(d["amount"], d["currency"])
+            doc.add_paragraph()
+
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -1139,6 +1260,29 @@ def export_pdf(suspect_ids=None):
             ["Direction", "Suspect", "Exchange", "Amount", "Date", "Address"],
             unmatched_rows
         ))
+
+    # --- Chains ---
+    if ctx["chains"]:
+        elements.append(Spacer(1, 16))
+        elements.append(Paragraph("Chains", styles["Heading1"]))
+        elements.append(Paragraph(
+            f"{len(ctx['chains'])} multi-hop chain(s) - each links 2+ already-detected transfers "
+            f"where the same person received money in one, then sent it on in another shortly "
+            f"after. Longest first.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+        for i, chain in enumerate(ctx["chains"], start=1):
+            path = " -> ".join(_pdf_escape(p["withdrawal"]["suspect_name"]) for p in chain) + " -> " + _pdf_escape(chain[-1]["deposit"]["suspect_name"])
+            elements.append(Paragraph(f"<b>Chain {i}: {path}</b> ({len(chain)} hops)", styles["Normal"]))
+            chain_rows = []
+            for hop_num, p in enumerate(chain, start=1):
+                w, d = p["withdrawal"], p["deposit"]
+                chain_rows.append([
+                    str(hop_num), "TXID" if p["match_type"] == "txid" else "Address",
+                    f"{w['suspect_name']} ({w['exchange']})", _fmt_amount_export(w["amount"], w["currency"]),
+                    f"{d['suspect_name']} ({d['exchange']})", _fmt_amount_export(d["amount"], d["currency"]),
+                ])
+            elements.append(add_table(["Hop", "Match", "From", "Amount", "To", "Amount"], chain_rows))
+            elements.append(Spacer(1, 10))
 
     doc.build(elements)
     buf.seek(0)
@@ -1554,6 +1698,17 @@ HTML_PAGE = """
     .transfer-arrow { color: var(--accent); font-size: 20px; }
     .transfer-gap { font-size: 11.5px; color: var(--text-dim); margin-top: 10px; }
 
+    .chain-card {
+        background: var(--bg-card); border: 1px solid var(--accent-dim); border-radius: var(--radius);
+        padding: 16px; margin-bottom: 20px;
+    }
+    .chain-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .chain-path { font-size: 14px; }
+    .chain-card .transfer-card { background: #10141f; margin-bottom: 0; }
+    .chain-link {
+        text-align: center; font-size: 12px; color: var(--text-dim); padding: 10px 0;
+    }
+
     .results-note { font-size: 12.5px; color: var(--text-dim); margin-bottom: 12px; }
 
     .export-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -1694,6 +1849,7 @@ HTML_PAGE = """
                     <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
                     <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
                     <button class="tab-btn" id="subTabTransfers" onclick="switchAnalysisTab('transfers')">Transfers</button>
+                    <button class="tab-btn" id="subTabChains" onclick="switchAnalysisTab('chains')">Chains</button>
                     <button class="tab-btn" id="subTabGraph" onclick="switchAnalysisTab('graph')">Graph</button>
                 </div>
                 <div id="analysisContent"></div>
@@ -2061,6 +2217,7 @@ function switchAnalysisTab(tab) {
     document.getElementById("subTabAddresses").classList.toggle("active", tab === "addresses");
     document.getElementById("subTabAmounts").classList.toggle("active", tab === "amounts");
     document.getElementById("subTabTransfers").classList.toggle("active", tab === "transfers");
+    document.getElementById("subTabChains").classList.toggle("active", tab === "chains");
     document.getElementById("subTabGraph").classList.toggle("active", tab === "graph");
     loadAnalysisTab(tab);
 }
@@ -2071,6 +2228,7 @@ function loadAnalysisTab(tab) {
     if (tab === "addresses") loadAddresses(container);
     else if (tab === "amounts") loadAmounts(container);
     else if (tab === "transfers") loadTransfers(container);
+    else if (tab === "chains") loadChains(container);
     else if (tab === "graph") loadGraph(container);
 }
 
@@ -2239,7 +2397,7 @@ function saveAddressNote(address) {
 // Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
 // highlighting/focusing a matching node instead of filtering a list).
 let analysisSearchQuery = "";
-let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null;
+let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null, cachedChains = null;
 
 function matchesSearch(text) {
     if (!analysisSearchQuery) return true;
@@ -2272,6 +2430,7 @@ function reapplyAnalysisSearch() {
     if (currentAnalysisTab === "addresses") { if (cachedAddresses) renderAddresses(container); else loadAddresses(container); }
     else if (currentAnalysisTab === "amounts") { if (cachedAmounts) renderAmounts(container); else loadAmounts(container); }
     else if (currentAnalysisTab === "transfers") { if (cachedTransfers) renderTransfers(container); else loadTransfers(container); }
+    else if (currentAnalysisTab === "chains") { if (cachedChains) renderChains(container); else loadChains(container); }
     else if (currentAnalysisTab === "graph") focusGraphSearchMatch();
 }
 
@@ -2365,6 +2524,103 @@ function loadTransfers(container) {
     });
 }
 
+// Renders one withdrawal<->deposit hop card. Shared by the Transfers tab (one hop per card)
+// and the Chains tab (several of these stacked per chain, connected by transferChainLinkHtml).
+function transferCardHtml(p) {
+    const w = p.withdrawal, d = p.deposit;
+    const who = p.same_suspect
+        ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
+        : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
+    const viaLabel = p.match_type === "txid"
+        ? `matching TX hash <span class="addr-mono">${highlightMatch(w.txid)}</span>`
+        : `shared address <span class="addr-mono">${highlightMatch(p.address)}</span>`;
+    return `<div class="transfer-card">
+        <div class="addr-line">
+            ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
+            ${who} — via ${viaLabel}
+            ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
+            ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
+            ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
+        </div>
+        <div class="transfer-flow">
+            <div class="transfer-side">
+                <div class="label">Sent (withdrawal)</div>
+                <div class="exchange-name">${escapeHtml(w.exchange)}</div>
+                <div>${escapeHtml(w.suspect_name)}</div>
+                <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
+                <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
+                <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
+            </div>
+            <div class="transfer-arrow">→</div>
+            <div class="transfer-side">
+                <div class="label">Received (deposit)</div>
+                <div class="exchange-name">${escapeHtml(d.exchange)}</div>
+                <div>${escapeHtml(d.suspect_name)}</div>
+                <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
+                <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
+                <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
+            </div>
+        </div>
+        <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
+    </div>`;
+}
+
+function loadChains(container) {
+    fetch("/analysis/chains" + suspectsQueryParam()).then(r => r.json()).then(data => {
+        cachedChains = data;
+        renderChains(container);
+    }).catch(err => {
+        container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
+    });
+}
+
+function renderChains(container) {
+    const allChains = cachedChains || [];
+    if (!allChains.length) {
+        container.innerHTML = '<div class="analysis-empty">No multi-hop chains detected yet - chains need at least 2 linked transfers (someone receiving money, then sending it on).</div>';
+        return;
+    }
+
+    const chains = allChains.filter(c => c.some(p =>
+        matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid)
+    ));
+    if (!chains.length) {
+        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        return;
+    }
+
+    let html = `<div class="results-note">
+        ${chains.length}${analysisSearchQuery ? ` of ${allChains.length}` : ""} chain(s) shown — each links 2+ already-detected transfers where
+        the same person received money in one, then sent it on in another shortly after. Longest first.
+    </div>`;
+
+    chains.forEach(chain => {
+        const start = chain[0].withdrawal, end = chain[chain.length - 1].deposit;
+        const peopleInChain = new Set();
+        chain.forEach(p => { peopleInChain.add(p.withdrawal.suspect_id); peopleInChain.add(p.deposit.suspect_id); });
+        const totalHours = Math.round((new Date(end.date) - new Date(start.date)) / 36000) / 100;
+
+        html += `<div class="chain-card">
+            <div class="chain-header">
+                <span class="chain-path">${chain.map(p => `<b>${escapeHtml(p.withdrawal.suspect_name)}</b>`).join(" → ")} → <b>${escapeHtml(end.suspect_name)}</b></span>
+                <span class="same-person-badge">${chain.length} HOPS</span>
+                <span class="${peopleInChain.size > 1 ? 'diff-suspect-badge' : 'same-person-badge'}">${peopleInChain.size} ${peopleInChain.size > 1 ? 'PEOPLE' : 'PERSON'}</span>
+                <span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">~${totalHours}h START TO END</span>
+            </div>`;
+        chain.forEach((hop, i) => {
+            html += transferCardHtml(hop);
+            if (i < chain.length - 1) {
+                const nextHop = chain[i + 1];
+                const gapToNext = Math.round((new Date(nextHop.withdrawal.date) - new Date(hop.deposit.date)) / 36000) / 100;
+                html += `<div class="chain-link">↓ <b>${escapeHtml(hop.deposit.suspect_name)}</b> then sent this on, ${gapToNext} hour(s) later ↓</div>`;
+            }
+        });
+        html += `</div>`;
+    });
+
+    container.innerHTML = html;
+}
+
 function renderTransfers(container) {
     const allMatched = (cachedTransfers && cachedTransfers.matched) || [];
     const allUnmatched = (cachedTransfers && cachedTransfers.unmatched) || [];
@@ -2391,44 +2647,7 @@ function renderTransfers(container) {
         ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
     </div>`;
 
-    matched.forEach(p => {
-        const w = p.withdrawal, d = p.deposit;
-        const who = p.same_suspect
-            ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
-            : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
-        const viaLabel = p.match_type === "txid"
-            ? `matching TX hash <span class="addr-mono">${highlightMatch(w.txid)}</span>`
-            : `shared address <span class="addr-mono">${highlightMatch(p.address)}</span>`;
-        html += `<div class="transfer-card">
-            <div class="addr-line">
-                ${p.match_type === "txid" ? '<span class="same-person-badge" style="background:rgba(62,207,142,0.18);color:var(--success);">✓ CONFIRMED (SAME TXID)</span> ' : '<span class="unverified-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">PROBABLE (SAME ADDRESS)</span> '}
-                ${who} — via ${viaLabel}
-                ${p.same_suspect ? '<span class="same-person-badge">SAME PERSON</span>' : '<span class="diff-suspect-badge">DIFFERENT PEOPLE</span>'}
-                ${!p.same_exchange ? '<span class="same-person-badge" style="background:rgba(139,147,167,0.18);color:var(--text-dim);">CROSS-EXCHANGE</span>' : ""}
-                ${!p.amount_matched ? '<span class="unverified-badge" title="Amount and/or currency could not be confirmed between the two sides - verify manually.">⚠ AMOUNT UNVERIFIED</span>' : ""}
-            </div>
-            <div class="transfer-flow">
-                <div class="transfer-side">
-                    <div class="label">Sent (withdrawal)</div>
-                    <div class="exchange-name">${escapeHtml(w.exchange)}</div>
-                    <div>${escapeHtml(w.suspect_name)}</div>
-                    <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
-                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
-                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
-                </div>
-                <div class="transfer-arrow">→</div>
-                <div class="transfer-side">
-                    <div class="label">Received (deposit)</div>
-                    <div class="exchange-name">${escapeHtml(d.exchange)}</div>
-                    <div>${escapeHtml(d.suspect_name)}</div>
-                    <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
-                    <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
-                    <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
-                </div>
-            </div>
-            <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
-        </div>`;
-    });
+    matched.forEach(p => { html += transferCardHtml(p); });
 
     if (unmatched.length) {
         html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
