@@ -10,6 +10,9 @@ import uuid
 import io
 import os
 import json
+import time
+import atexit
+import threading
 import traceback
 from datetime import datetime
 from docx import Document
@@ -1415,8 +1418,9 @@ def delete_file(file_id):
 CASE_FORMAT_VERSION = 1
 
 
-@app.route("/case/export")
-def export_case():
+def _build_case_dict():
+    """The full session state as a JSON-safe dict - shared by the manual "Save case"
+    download and the periodic background autosave."""
     files = []
     for file_id, entry in CATALOG.items():
         ndf = entry.get("normalized_dataframe")
@@ -1432,7 +1436,7 @@ def export_case():
             "normalized_dataframe_json": ndf.to_json(orient="records", date_format="iso") if ndf is not None else None,
         })
 
-    case = {
+    return {
         "cryptolink_case_version": CASE_FORMAT_VERSION,
         "saved_at": datetime.now().isoformat(),
         "suspects": SUSPECTS,
@@ -1440,6 +1444,40 @@ def export_case():
         "address_notes": ADDRESS_NOTES,
         "files": files,
     }
+
+
+def _apply_case_dict(case):
+    """Replaces the entire in-memory session with a case dict previously produced by
+    _build_case_dict() - shared by manual "Load case" and restoring an autosave. Raises on
+    malformed input; the caller decides how to report that."""
+    new_catalog = {}
+    for entry in case["files"]:
+        df = pd.read_json(io.StringIO(entry["dataframe_json"]), orient="records")
+        ndf = (pd.read_json(io.StringIO(entry["normalized_dataframe_json"]), orient="records")
+               if entry.get("normalized_dataframe_json") else None)
+        new_catalog[entry["file_id"]] = {
+            "filename": entry["filename"], "sheet_name": entry["sheet_name"],
+            "exchange": entry["exchange"], "file_type": entry["file_type"],
+            "columns": entry["columns"], "row_count": entry["row_count"],
+            "dataframe": df, "suspect_id": entry["suspect_id"],
+            "normalized_dataframe": ndf, "missing_fields": entry["missing_fields"],
+        }
+
+    # Loading a case replaces the current session entirely - a case file is a full snapshot,
+    # not something to merge with whatever's already open.
+    SUSPECTS.clear()
+    SUSPECTS.update(case["suspects"])
+    CATALOG.clear()
+    CATALOG.update(new_catalog)
+    EXCLUDED_ADDRESSES.clear()
+    EXCLUDED_ADDRESSES.update(case.get("excluded_addresses", {}))
+    ADDRESS_NOTES.clear()
+    ADDRESS_NOTES.update(case.get("address_notes", {}))
+
+
+@app.route("/case/export")
+def export_case():
+    case = _build_case_dict()
     buf = io.BytesIO(json.dumps(case, ensure_ascii=False, indent=2).encode("utf-8"))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return send_file(buf, as_attachment=True, download_name=f"cryptolink_case_{stamp}.json",
@@ -1461,33 +1499,76 @@ def import_case():
         return jsonify({"error": "Not a valid CryptoLink case file"}), 400
 
     try:
-        new_catalog = {}
-        for entry in case["files"]:
-            df = pd.read_json(io.StringIO(entry["dataframe_json"]), orient="records")
-            ndf = (pd.read_json(io.StringIO(entry["normalized_dataframe_json"]), orient="records")
-                   if entry.get("normalized_dataframe_json") else None)
-            new_catalog[entry["file_id"]] = {
-                "filename": entry["filename"], "sheet_name": entry["sheet_name"],
-                "exchange": entry["exchange"], "file_type": entry["file_type"],
-                "columns": entry["columns"], "row_count": entry["row_count"],
-                "dataframe": df, "suspect_id": entry["suspect_id"],
-                "normalized_dataframe": ndf, "missing_fields": entry["missing_fields"],
-            }
+        _apply_case_dict(case)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Failed to load case: {str(e)}"}), 500
 
-    # Loading a case replaces the current session entirely - a case file is a full snapshot,
-    # not something to merge with whatever's already open.
-    SUSPECTS.clear()
-    SUSPECTS.update(case["suspects"])
-    CATALOG.clear()
-    CATALOG.update(new_catalog)
-    EXCLUDED_ADDRESSES.clear()
-    EXCLUDED_ADDRESSES.update(case.get("excluded_addresses", {}))
-    ADDRESS_NOTES.clear()
-    ADDRESS_NOTES.update(case.get("address_notes", {}))
+    return jsonify({
+        "success": True,
+        "suspect_count": len(SUSPECTS),
+        "file_count": len(CATALOG),
+        "saved_at": case.get("saved_at"),
+    })
 
+
+# ---------------------------------------------------------------------------
+# CASE AUTOSAVE
+# ---------------------------------------------------------------------------
+# A background thread periodically writes the current session straight to a local file (no
+# browser download dialog, nothing for the user to click) so a crash or an accidental window
+# close loses at most a couple of minutes of work instead of everything since the last manual
+# "Save case". Purely a local safety net - it never uploads or sends this anywhere.
+
+AUTOSAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptolink_autosave.json")
+AUTOSAVE_INTERVAL_SECONDS = 120
+
+
+def _write_autosave():
+    if not SUSPECTS and not CATALOG:
+        return  # nothing to protect against losing yet
+    try:
+        tmp_path = AUTOSAVE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_build_case_dict(), f, ensure_ascii=False)
+        os.replace(tmp_path, AUTOSAVE_PATH)  # atomic on both POSIX and Windows - never leaves a half-written file
+    except Exception:
+        traceback.print_exc()
+
+
+def _autosave_loop():
+    while True:
+        time.sleep(AUTOSAVE_INTERVAL_SECONDS)
+        _write_autosave()
+
+
+def start_autosave_thread():
+    threading.Thread(target=_autosave_loop, daemon=True).start()
+
+
+@app.route("/case/autosave/status")
+def autosave_status():
+    if not os.path.exists(AUTOSAVE_PATH):
+        return jsonify({"exists": False})
+    try:
+        with open(AUTOSAVE_PATH, encoding="utf-8") as f:
+            saved_at = json.load(f).get("saved_at")
+    except Exception:
+        return jsonify({"exists": False})
+    return jsonify({"exists": True, "saved_at": saved_at})
+
+
+@app.route("/case/autosave/restore", methods=["POST"])
+def restore_autosave():
+    if not os.path.exists(AUTOSAVE_PATH):
+        return jsonify({"error": "No autosave found"}), 404
+    try:
+        with open(AUTOSAVE_PATH, encoding="utf-8") as f:
+            case = json.load(f)
+        _apply_case_dict(case)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to restore autosave: {str(e)}"}), 500
     return jsonify({
         "success": True,
         "suspect_count": len(SUSPECTS),
@@ -1524,6 +1605,12 @@ HTML_PAGE = """
     header p { color: var(--text-dim); margin: 0; font-size: 14px; }
     .header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
     .case-actions { display: flex; gap: 8px; flex-shrink: 0; }
+    .autosave-banner {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        background: rgba(79,140,255,0.1); border: 1px solid var(--accent-dim); border-radius: var(--radius);
+        padding: 12px 16px; margin-bottom: 20px; font-size: 13px;
+    }
+    .autosave-banner .actions { display: flex; gap: 8px; flex-shrink: 0; }
 
     .panel {
         background: var(--bg-card); border: 1px solid var(--border);
@@ -1791,6 +1878,8 @@ HTML_PAGE = """
             </div>
         </div>
     </header>
+
+    <div id="autosaveBanner" class="autosave-banner" style="display:none;"></div>
 
     <div class="main-tabs">
         <button class="tab-btn active" id="tabBtnFiles" onclick="switchMainTab('files')">Files</button>
@@ -2924,7 +3013,50 @@ function initApp() {
     fetch("/files").then(r => r.json()).then(files => {
         files.forEach(item => { catalogData[item.id] = item; });
         refreshSuspects();
+        // Only offer to restore an autosave into an otherwise-empty session - if files were
+        // already reloaded here (server never restarted) there's nothing to recover.
+        if (files.length === 0) checkAutosaveBanner();
     });
+}
+
+function checkAutosaveBanner() {
+    fetch("/case/autosave/status").then(r => r.json()).then(status => {
+        if (!status.exists) return;
+        const when = status.saved_at ? new Date(status.saved_at).toLocaleString() : "an earlier session";
+        const banner = document.getElementById("autosaveBanner");
+        banner.innerHTML = `
+            <span>💾 Found an autosave from ${escapeHtml(when)} - looks like the app didn't close cleanly last time.</span>
+            <span class="actions">
+                <button class="btn small" onclick="restoreAutosave()">Restore</button>
+                <button class="btn small" onclick="dismissAutosaveBanner()">Dismiss</button>
+            </span>
+        `;
+        banner.style.display = "flex";
+    }).catch(() => {});
+}
+
+function dismissAutosaveBanner() {
+    document.getElementById("autosaveBanner").style.display = "none";
+}
+
+function restoreAutosave() {
+    fetch("/case/autosave/restore", { method: "POST" })
+        .then(r => r.json().then(data => ({ ok: r.ok, data })))
+        .then(({ ok, data }) => {
+            if (!ok || data.error) { showToast(data.error || "Failed to restore autosave", true); return; }
+            dismissAutosaveBanner();
+            activeSuspectId = "";
+            collapsedSuspects = {};
+            catalogData = {};
+            suspectFilterSelected = new Set();
+            fetch("/files").then(r => r.json()).then(files => {
+                files.forEach(item => { catalogData[item.id] = item; });
+                refreshSuspects();
+                updateDropzoneState();
+                showToast(`Autosave restored: ${data.suspect_count} suspect(s), ${data.file_count} file(s)`, false);
+            });
+        })
+        .catch(err => showToast("Network error restoring autosave: " + err, true));
 }
 
 initApp();
@@ -2939,4 +3071,10 @@ if __name__ == "__main__":
     print("CryptoLink starting.")
     print("Open your browser at: http://127.0.0.1:5000")
     print("=" * 50)
+    # debug=True runs Flask under a reloader, which re-executes this whole block in a child
+    # process - only start the background thread there (WERKZEUG_RUN_MAIN=="true"), not in
+    # the parent watcher process too, or every autosave would run twice.
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_autosave_thread()
+        atexit.register(_write_autosave)  # best-effort final save on a clean Ctrl+C/exit
     app.run(debug=True, port=5000)
