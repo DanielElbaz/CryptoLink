@@ -1445,9 +1445,18 @@ def compute_graph_data(suspect_ids=None):
             title = f"{agg['count']} transaction(s) ({agg['deposits']} deposit, {agg['withdrawals']} withdrawal) via {', '.join(sorted(agg['exchanges']))}"
             if agg["total_usd"]:
                 title += f" — ~${agg['total_usd']:,.2f}"
+            # Edge is defined suspect -> address. A withdrawal sends money from the suspect to
+            # that address (arrow into the address, the "to" end); a deposit receives money
+            # from that address into the suspect (arrow into the suspect, the "from" end).
+            # Both happening on the same wallet just means both arrowheads are shown.
+            arrows = {}
+            if agg["withdrawals"] > 0:
+                arrows["to"] = {"enabled": True}
+            if agg["deposits"] > 0:
+                arrows["from"] = {"enabled": True}
             edges.append({
                 "from": suspect_node_id, "to": addr_id,
-                "value": agg["count"], "title": title,
+                "value": agg["count"], "title": title, "arrows": arrows,
             })
 
     # Direct suspect-to-suspect edges for TXID-confirmed transfers between two different
@@ -1464,7 +1473,7 @@ def compute_graph_data(suspect_ids=None):
                 nodes[node_id] = {"id": node_id, "label": name, "title": name, "group": "suspect"}
         edges.append({
             "from": f"suspect:{w['suspect_id']}", "to": f"suspect:{d['suspect_id']}",
-            "value": 3, "color": {"color": "#3ecf8e"},
+            "value": 3, "color": {"color": "#3ecf8e"}, "arrows": {"to": {"enabled": True}},
             "title": f"Confirmed transfer (same TXID {w['txid']}) — {w['amount']} {w['currency']} on {w['exchange']} → {d['exchange']}",
         })
 
@@ -3466,7 +3475,7 @@ let graphColorFilters = { cross: true, same: true };
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Hover a wallet node for actions.</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Arrows show the direction money moved. Hover a wallet node for actions.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterCross" ${graphColorFilters.cross ? "checked" : ""} onchange="setGraphColorFilter('cross', this.checked)"> <span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</label>
