@@ -1501,7 +1501,7 @@ HTML_PAGE = """
         --input-bg: #ffffff; --hover-bg: #eef1f6; --dropzone-hover-bg: #eaf0ff; --nested-bg: #f7f8fb;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh;zoom: 1.15; }
     .container { max-width: 1440px; margin: 0 auto; padding: 32px 20px 100px; }
     header { margin-bottom: 24px; }
     header h1 { font-size: 26px; margin: 0 0 6px; font-weight: 600; }
