@@ -18,6 +18,12 @@ import threading
 import webbrowser
 import traceback
 from datetime import datetime
+from docx import Document
+from docx.shared import Pt, RGBColor
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # keep UTF-8 (Hebrew, etc.) readable in JSON responses
@@ -890,6 +896,13 @@ def analysis_chains():
     return jsonify(compute_transfer_chains(_parse_suspect_ids()))
 
 
+def _pdf_escape(text):
+    """reportlab's Paragraph parses its text as pseudo-XML (for <b>, etc.) - free-text notes
+    can contain &, <, > from the user, which would otherwise break rendering or get
+    misinterpreted as markup."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _fmt_amount_export(amount, currency):
     if amount is None:
         return "-"
@@ -1030,13 +1043,349 @@ def export_xlsx(suspect_ids=None):
     return buf
 
 
-@app.route("/export/xlsx")
-def export_report():
+# ---------------------------------------------------------------------------
+# EXPORT - Word
+# ---------------------------------------------------------------------------
+
+def export_docx(suspect_ids=None):
+    ctx = build_report_context(suspect_ids)
+    doc = Document()
+
+    title = doc.add_heading("CryptoLink - Analysis Report", level=0)
+    meta = doc.add_paragraph()
+    meta.add_run(f"Generated: {ctx['generated_at']}\n").italic = True
+    meta.add_run(f"Suspects included: {', '.join(ctx['suspect_names'])}").italic = True
+
+    if ctx["suspect_notes"]:
+        doc.add_heading("Suspect notes", level=1)
+        for n in ctx["suspect_notes"]:
+            p = doc.add_paragraph()
+            p.add_run(n["name"] + ": ").bold = True
+            p.add_run(n["note"])
+
+    # --- Wallets ---
+    doc.add_heading("Wallets", level=1)
+    doc.add_paragraph(f"{len(ctx['addresses'])} distinct address(es), sorted by frequency.")
+    for item in ctx["addresses"]:
+        p = doc.add_paragraph()
+        run = p.add_run(item["address"])
+        run.bold = True
+        run.font.name = "Consolas"
+        p.add_run(f"  —  {item['occurrence_count']} occurrence(s), {item['distinct_accounts']} distinct account(s)")
+        if item["is_cross_suspect"]:
+            warn = p.add_run("  [SHARED BETWEEN DIFFERENT PEOPLE]")
+            warn.bold = True
+            warn.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
+        elif item["is_cross_account"]:
+            warn = p.add_run("  [SAME PERSON - MULTIPLE EXCHANGES]")
+            warn.bold = True
+            warn.font.color.rgb = RGBColor(0x1F, 0x5C, 0xA8)
+        if item["note"]:
+            note_p = doc.add_paragraph()
+            note_p.add_run("Note: ").italic = True
+            note_p.add_run(item["note"]).italic = True
+        if item["known_sightings"]:
+            known_p = doc.add_paragraph()
+            tag = known_p.add_run(f"👁 Seen in {len(item['known_sightings'])} previous case(s): ")
+            tag.bold = True
+            tag.font.color.rgb = RGBColor(0x7C, 0x3A, 0xED)
+            known_p.add_run("; ".join(f"{s['case_label']} ({s['suspect_name']})" for s in item["known_sightings"]))
+
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        for i, h in enumerate(["Suspect", "Exchange", "Type", "Amount", "Date", "TXID"]):
+            hdr[i].text = h
+        for o in item["occurrences"]:
+            row = table.add_row().cells
+            row[0].text = o["suspect_name"]
+            row[1].text = o["exchange"]
+            row[2].text = o["file_type"]
+            row[3].text = _fmt_amount_export(o["amount"], o["currency"])
+            row[4].text = _fmt_date_export(o["date"])
+            row[5].text = o["txid"] or "-"
+        doc.add_paragraph()
+
+    # --- Amounts ---
+    doc.add_heading("Amounts", level=1)
+    doc.add_paragraph(f"{len(ctx['amounts'])} transaction(s), sorted largest to smallest.")
+    table = doc.add_table(rows=1, cols=7)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    for i, h in enumerate(["Suspect", "Exchange", "Type", "Amount", "Date", "Address", "TXID"]):
+        hdr[i].text = h
+    for r in ctx["amounts"]:
+        row = table.add_row().cells
+        row[0].text = r["suspect_name"]
+        row[1].text = r["exchange"]
+        row[2].text = r["file_type"]
+        row[3].text = _fmt_amount_export(r["amount"], r["currency"]) + (f" ({_fmt_usd_export(r['amount_usd'])})" if r["amount_usd"] else "")
+        row[4].text = _fmt_date_export(r["date"])
+        row[5].text = r["external_address"] or "-"
+        row[6].text = r["txid"] or "-"
+
+    # --- Transfers ---
+    matched, unmatched = ctx["transfers"]["matched"], ctx["transfers"]["unmatched"]
+    doc.add_heading("Transfers", level=1)
+    doc.add_paragraph(
+        f"{len(matched)} confirmed transfer(s) - each withdrawal matched to its single most "
+        f"likely deposit (closest amount/currency, then closest time), sorted by time gap."
+    )
+    for p in matched:
+        w, d = p["withdrawal"], p["deposit"]
+        para = doc.add_paragraph()
+        if p["match_type"] == "txid":
+            tag = para.add_run("[CONFIRMED - SAME TXID]  ")
+            tag.bold = True
+            tag.font.color.rgb = RGBColor(0x0F, 0x8A, 0x4E)
+        para.add_run(f"Address: ").bold = True
+        run = para.add_run(p["address"] or "-")
+        run.font.name = "Consolas"
+        if not p["same_suspect"]:
+            warn = para.add_run("  [DIFFERENT PEOPLE]")
+            warn.bold = True
+            warn.font.color.rgb = RGBColor(0xC0, 0x80, 0x00)
+        else:
+            note = para.add_run("  [SAME PERSON]")
+            note.bold = True
+            note.font.color.rgb = RGBColor(0x1F, 0x5C, 0xA8)
+        if not p["same_exchange"]:
+            para.add_run("  (cross-exchange)")
+        if not p["amount_matched"]:
+            warn2 = para.add_run("  [amount unverified - review manually]")
+            warn2.italic = True
+            warn2.font.color.rgb = RGBColor(0xC0, 0x30, 0x30)
+
+        table = doc.add_table(rows=3, cols=2)
+        table.style = "Light Grid Accent 1"
+        table.rows[0].cells[0].text = "Withdrawal (sent)"
+        table.rows[0].cells[1].text = "Deposit (received)"
+        table.rows[1].cells[0].text = f"{w['exchange']} — {w['suspect_name']}\n{_fmt_amount_export(w['amount'], w['currency'])}\n{_fmt_date_export(w['date'])}"
+        table.rows[1].cells[1].text = f"{d['exchange']} — {d['suspect_name']}\n{_fmt_amount_export(d['amount'], d['currency'])}\n{_fmt_date_export(d['date'])}"
+        table.rows[2].cells[0].text = f"TXID: {w['txid'] or '-'}"
+        table.rows[2].cells[1].text = f"TXID: {d['txid'] or '-'}"
+        doc.add_paragraph(f"Time gap: {p['gap_hours']} hour(s)")
+        doc.add_paragraph()
+
+    if unmatched:
+        doc.add_heading("Unmatched movements (needs manual review)", level=1)
+        doc.add_paragraph(
+            f"{len(unmatched)} withdrawal(s)/deposit(s) couldn't be "
+            f"confidently paired with a counterpart."
+        )
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        for i, h in enumerate(["Direction", "Suspect", "Exchange", "Amount", "Date", "Address"]):
+            hdr[i].text = h
+        for u in unmatched:
+            row = table.add_row().cells
+            row[0].text = u["direction"]
+            row[1].text = u["suspect_name"]
+            row[2].text = u["exchange"]
+            row[3].text = _fmt_amount_export(u["amount"], u["currency"])
+            row[4].text = _fmt_date_export(u["date"])
+            row[5].text = u["address"]
+
+    # --- Chains ---
+    if ctx["chains"]:
+        doc.add_heading("Chains", level=1)
+        doc.add_paragraph(
+            f"{len(ctx['chains'])} multi-hop chain(s) - each links 2+ already-detected "
+            f"transfers where the same person received money in one, then sent it on in "
+            f"another shortly after. Longest first."
+        )
+        for i, chain in enumerate(ctx["chains"], start=1):
+            path = " -> ".join(p["withdrawal"]["suspect_name"] for p in chain) + " -> " + chain[-1]["deposit"]["suspect_name"]
+            doc.add_paragraph(f"Chain {i}: {path} ({len(chain)} hops)").runs[0].bold = True
+            table = doc.add_table(rows=1, cols=6)
+            table.style = "Light Grid Accent 1"
+            hdr = table.rows[0].cells
+            for j, h in enumerate(["Hop", "Match", "From", "Amount", "To", "Amount"]):
+                hdr[j].text = h
+            for hop_num, p in enumerate(chain, start=1):
+                w, d = p["withdrawal"], p["deposit"]
+                row = table.add_row().cells
+                row[0].text = str(hop_num)
+                row[1].text = "TXID" if p["match_type"] == "txid" else "Address"
+                row[2].text = f"{w['suspect_name']} ({w['exchange']})"
+                row[3].text = _fmt_amount_export(w["amount"], w["currency"])
+                row[4].text = f"{d['suspect_name']} ({d['exchange']})"
+                row[5].text = _fmt_amount_export(d["amount"], d["currency"])
+            doc.add_paragraph()
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# EXPORT - PDF
+# ---------------------------------------------------------------------------
+
+def export_pdf(suspect_ids=None):
+    ctx = build_report_context(suspect_ids)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), topMargin=30, bottomMargin=30)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=18)
+    warn_style = ParagraphStyle("Warn", parent=styles["Normal"], textColor=colors.HexColor("#C03030"), fontSize=8)
+
+    elements = [
+        Paragraph("CryptoLink - Analysis Report", title_style),
+        Paragraph(f"Generated: {ctx['generated_at']} | Suspects: {', '.join(ctx['suspect_names'])}", styles["Normal"]),
+        Spacer(1, 16),
+    ]
+
+    if ctx["suspect_notes"]:
+        elements.append(Paragraph("Suspect notes", styles["Heading1"]))
+        for n in ctx["suspect_notes"]:
+            elements.append(Paragraph(f"<b>{_pdf_escape(n['name'])}:</b> {_pdf_escape(n['note'])}", styles["Normal"]))
+        elements.append(Spacer(1, 16))
+
+    def add_table(headers, rows, col_widths=None):
+        data = [headers] + rows
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F5F5")]),
+        ]))
+        return t
+
+    # --- Wallets ---
+    elements.append(Paragraph("Wallets", styles["Heading1"]))
+    elements.append(Paragraph(f"{len(ctx['addresses'])} distinct address(es), sorted by frequency.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+    wallet_rows = []
+    for item in ctx["addresses"]:
+        known = "; ".join(f"{s['case_label']}" for s in item["known_sightings"])[:30] or "-"
+        for o in item["occurrences"]:
+            wallet_rows.append([
+                item["address"][:40], (item["note"] or "-")[:30], known, str(item["occurrence_count"]),
+                "DIFF. PEOPLE" if item["is_cross_suspect"] else ("same person" if item["is_cross_account"] else ""),
+                o["suspect_name"], o["exchange"], o["file_type"],
+                _fmt_amount_export(o["amount"], o["currency"]), _fmt_date_export(o["date"]), (o["txid"] or "-")[:24],
+            ])
+    if wallet_rows:
+        elements.append(add_table(
+            ["Address", "Note", "Seen Elsewhere", "Occ.", "Shared", "Suspect", "Exchange", "Type", "Amount", "Date", "TXID"],
+            wallet_rows
+        ))
+    elements.append(Spacer(1, 16))
+
+    # --- Amounts ---
+    elements.append(Paragraph("Amounts", styles["Heading1"]))
+    elements.append(Paragraph(f"{len(ctx['amounts'])} transaction(s), sorted largest to smallest.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+    amount_rows = [[
+        r["suspect_name"], r["exchange"], r["file_type"],
+        _fmt_amount_export(r["amount"], r["currency"]), _fmt_date_export(r["date"]),
+        (r["external_address"] or "-")[:30], (r["txid"] or "-")[:24],
+    ] for r in ctx["amounts"]]
+    if amount_rows:
+        elements.append(add_table(
+            ["Suspect", "Exchange", "Type", "Amount", "Date", "Address", "TXID"],
+            amount_rows
+        ))
+    elements.append(Spacer(1, 16))
+
+    # --- Transfers ---
+    matched, unmatched = ctx["transfers"]["matched"], ctx["transfers"]["unmatched"]
+    elements.append(Paragraph("Transfers", styles["Heading1"]))
+    elements.append(Paragraph(
+        f"{len(matched)} confirmed transfer(s) - each withdrawal matched to its single most likely "
+        f"deposit (closest amount/currency, then closest time), sorted by time gap.", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+    transfer_rows = []
+    for p in matched:
+        w, d = p["withdrawal"], p["deposit"]
+        flags = ["TXID" if p["match_type"] == "txid" else "address"]
+        flags.append("DIFF. PEOPLE" if not p["same_suspect"] else "same person")
+        if not p["same_exchange"]:
+            flags.append("cross-exch.")
+        if not p["amount_matched"]:
+            flags.append("unverified amt")
+        transfer_rows.append([
+            (p["address"] or "-")[:30], " / ".join(flags), str(p["gap_hours"]),
+            f"{w['exchange']}/{w['suspect_name']}", _fmt_amount_export(w["amount"], w["currency"]), _fmt_date_export(w["date"]),
+            f"{d['exchange']}/{d['suspect_name']}", _fmt_amount_export(d["amount"], d["currency"]), _fmt_date_export(d["date"]),
+        ])
+    if transfer_rows:
+        elements.append(add_table(
+            ["Address", "Flags", "Gap (h)", "Withdrawal from", "W. Amount", "W. Date",
+             "Deposit to", "D. Amount", "D. Date"],
+            transfer_rows
+        ))
+    elements.append(Spacer(1, 16))
+
+    # --- Unmatched movements ---
+    if unmatched:
+        elements.append(Paragraph("Unmatched movements (needs manual review)", styles["Heading1"]))
+        elements.append(Paragraph(
+            f"{len(unmatched)} withdrawal(s)/deposit(s) couldn't be "
+            f"confidently paired with a counterpart.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+        unmatched_rows = [[
+            u["direction"], u["suspect_name"], u["exchange"],
+            _fmt_amount_export(u["amount"], u["currency"]), _fmt_date_export(u["date"]), u["address"][:30],
+        ] for u in unmatched]
+        elements.append(add_table(
+            ["Direction", "Suspect", "Exchange", "Amount", "Date", "Address"],
+            unmatched_rows
+        ))
+
+    # --- Chains ---
+    if ctx["chains"]:
+        elements.append(Spacer(1, 16))
+        elements.append(Paragraph("Chains", styles["Heading1"]))
+        elements.append(Paragraph(
+            f"{len(ctx['chains'])} multi-hop chain(s) - each links 2+ already-detected transfers "
+            f"where the same person received money in one, then sent it on in another shortly "
+            f"after. Longest first.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+        for i, chain in enumerate(ctx["chains"], start=1):
+            path = " -> ".join(_pdf_escape(p["withdrawal"]["suspect_name"]) for p in chain) + " -> " + _pdf_escape(chain[-1]["deposit"]["suspect_name"])
+            elements.append(Paragraph(f"<b>Chain {i}: {path}</b> ({len(chain)} hops)", styles["Normal"]))
+            chain_rows = []
+            for hop_num, p in enumerate(chain, start=1):
+                w, d = p["withdrawal"], p["deposit"]
+                chain_rows.append([
+                    str(hop_num), "TXID" if p["match_type"] == "txid" else "Address",
+                    f"{w['suspect_name']} ({w['exchange']})", _fmt_amount_export(w["amount"], w["currency"]),
+                    f"{d['suspect_name']} ({d['exchange']})", _fmt_amount_export(d["amount"], d["currency"]),
+                ])
+            elements.append(add_table(["Hop", "Match", "From", "Amount", "To", "Amount"], chain_rows))
+            elements.append(Spacer(1, 10))
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
+@app.route("/export/<fmt>")
+def export_report(fmt):
     suspect_ids = _parse_suspect_ids()
+
     try:
-        buf = export_xlsx(suspect_ids)
-        return send_file(buf, as_attachment=True, download_name="cryptolink_report.xlsx",
-                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if fmt == "xlsx":
+            buf = export_xlsx(suspect_ids)
+            return send_file(buf, as_attachment=True, download_name="cryptolink_report.xlsx",
+                              mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        elif fmt == "docx":
+            buf = export_docx(suspect_ids)
+            return send_file(buf, as_attachment=True, download_name="cryptolink_report.docx",
+                              mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        elif fmt == "pdf":
+            buf = export_pdf(suspect_ids)
+            return send_file(buf, as_attachment=True, download_name="cryptolink_report.pdf",
+                              mimetype="application/pdf")
+        else:
+            return jsonify({"error": "Unknown format"}), 400
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Export failed: {str(e)}"}), 500
@@ -1502,7 +1851,7 @@ HTML_PAGE = """
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-    .container { max-width: 1440px; margin: 0 auto; padding: 32px 20px 100px; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 32px 20px 100px; }
     header { margin-bottom: 24px; }
     header h1 { font-size: 26px; margin: 0 0 6px; font-weight: 600; }
     header p { color: var(--text-dim); margin: 0; font-size: 14px; }
@@ -1749,7 +2098,6 @@ HTML_PAGE = """
     }
 
     .results-note { font-size: 12.5px; color: var(--text-dim); margin-bottom: 12px; }
-    .load-more-row { text-align: center; margin-top: 16px; }
 
     .sortable-th { cursor: pointer; user-select: none; white-space: nowrap; }
     .sortable-th:hover { color: var(--text); }
@@ -1763,6 +2111,7 @@ HTML_PAGE = """
     .filter-chip.active { background: var(--accent-dim); color: var(--btn-text); border-color: var(--accent-dim); }
 
     .export-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .export-label { font-size: 12.5px; color: var(--text-dim); margin-right: 4px; }
     a.btn { text-decoration: none; display: inline-block; }
 
     .field-warning {
@@ -1782,13 +2131,13 @@ HTML_PAGE = """
 
     .analysis-filter-panel {
         background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
-        padding: 12px 14px; margin-bottom: 16px;
+        padding: 12px 14px; margin-bottom: 16px; max-width: 640px;
     }
-    .filter-panel-row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 10px; }
+    .filter-panel-row { display: flex; align-items: center; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
     .filter-panel-row:last-of-type { margin-bottom: 0; }
-    .filter-panel-row label { display: flex; flex-direction: column; align-items: stretch; gap: 4px; font-size: 12.5px; color: var(--text-dim); }
+    .filter-panel-row label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-dim); }
     .filter-panel-row input[type="date"], .filter-panel-row input[type="text"] {
-        width: 100%; font-size: 12.5px; padding: 5px 8px; background: var(--input-bg); color: var(--text);
+        font-size: 12.5px; padding: 5px 8px; background: var(--input-bg); color: var(--text);
         border: 1px solid var(--border); border-radius: 6px;
     }
     .filter-exchange-list { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -1801,7 +2150,6 @@ HTML_PAGE = """
         margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
     }
     .graph-toggle { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; cursor: pointer; }
-    .graph-export-actions { display: flex; gap: 8px; flex-shrink: 0; }
     .graph-legend { display: flex; gap: 14px; flex-wrap: wrap; }
     .legend-item { font-size: 11.5px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -1822,9 +2170,6 @@ HTML_PAGE = """
 
     .analysis-layout { display: flex; gap: 20px; align-items: flex-start; }
     .analysis-main { flex: 1; min-width: 0; }
-    .analysis-filters-sidebar {
-        flex: 0 0 280px; position: sticky; top: 20px; max-height: calc(100vh - 40px); overflow-y: auto;
-    }
     .hidden-wallets-sidebar {
         flex: 0 0 260px; background: var(--bg-card); border: 1px solid var(--border);
         border-radius: var(--radius); padding: 14px; position: sticky; top: 20px;
@@ -1834,9 +2179,9 @@ HTML_PAGE = """
     .hidden-wallet-item:last-child { border-bottom: none; padding-bottom: 0; }
     .hidden-wallet-addr { display: flex; align-items: center; gap: 6px; }
     .hidden-wallet-meta { font-size: 11.5px; color: var(--text-dim); margin: 4px 0 8px; }
-    @media (max-width: 1150px) {
+    @media (max-width: 900px) {
         .analysis-layout { flex-direction: column; }
-        .hidden-wallets-sidebar, .analysis-filters-sidebar { flex: none; width: 100%; position: static; max-height: none; }
+        .hidden-wallets-sidebar { flex: none; width: 100%; position: static; }
     }
 
     .row-actions { display: inline-flex; gap: 2px; margin-left: 8px; opacity: 0; transition: opacity 0.12s ease; vertical-align: middle; }
@@ -1914,7 +2259,10 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
     <div id="analysisView" style="display:none;">
         <div class="export-panel">
             <div class="export-row">
-                <button class="btn small" onclick="triggerExport()">📊 Export to Excel</button>
+                <span class="export-label">Export report:</span>
+                <button class="btn small" onclick="triggerExport('docx')">Word (.docx)</button>
+                <button class="btn small" onclick="triggerExport('xlsx')">Excel (.xlsx)</button>
+                <button class="btn small" onclick="triggerExport('pdf')">PDF</button>
                 <button class="btn small" id="suspectFilterToggleBtn" onclick="toggleSuspectFilterPanel()">Filter suspects ▾</button>
                 <button class="btn small" id="knownWalletsToggleBtn" onclick="toggleKnownWalletsPanel()">📚 Add wallets to database</button>
             </div>
@@ -1950,12 +2298,12 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
             </div>
         </div>
         <div class="analysis-layout">
-            <aside class="analysis-filters-sidebar">
+            <div class="analysis-main">
                 <div class="search-row">
                     <input type="text" id="analysisSearch" placeholder="Search by wallet address or TXID..." oninput="onAnalysisSearch(this.value)">
                     <button class="btn small" id="analysisSearchClear" onclick="clearAnalysisSearch()" style="display:none;">Clear</button>
+                    <button class="btn small" id="analysisFilterToggleBtn" onclick="toggleAnalysisFilterPanel()">🔎 Filters ▾</button>
                 </div>
-                <button class="btn small" id="analysisFilterToggleBtn" onclick="toggleAnalysisFilterPanel()" style="width:100%;margin-bottom:10px;">🔎 Filters ▾</button>
                 <div id="analysisFilterPanel" class="analysis-filter-panel" style="display:none;">
                     <div class="filter-panel-row">
                         <label>From <input type="date" id="filterDateFrom" onchange="onAnalysisFilterChange()"></label>
@@ -1971,8 +2319,6 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                         <button class="btn small" onclick="clearAnalysisFilters()">Clear filters</button>
                     </div>
                 </div>
-            </aside>
-            <div class="analysis-main">
                 <div class="sub-tabs">
                     <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
                     <button class="tab-btn" id="subTabAmounts" onclick="switchAnalysisTab('amounts')">Amounts</button>
@@ -2746,7 +3092,6 @@ function personFilterChip(value, label) {
 
 function setTransferPersonFilter(value) {
     transferPersonFilter = value;
-    transfersPageSize = ANALYSIS_PAGE_SIZE;
     renderTransfers(document.getElementById("analysisContent"));
 }
 
@@ -2755,32 +3100,6 @@ function setTransferPersonFilter(value) {
 // column, same "no re-fetch needed" pattern as search/person filter).
 let amountsSort = { key: null, dir: "desc" };
 let transfersSort = { key: null, dir: "desc" };
-
-// Amounts/Transfers can easily reach thousands of rows - only the first PAGE_SIZE are
-// rendered, with a "Load more" button bumping the count. Reset to the first page whenever
-// the search/filter/sort actually changes (see reapplyAnalysisSearch, setAmountsSort,
-// setTransfersSort, setTransferPersonFilter) so a new query doesn't stay scrolled deep in.
-const ANALYSIS_PAGE_SIZE = 50;
-let amountsPageSize = ANALYSIS_PAGE_SIZE;
-let transfersPageSize = ANALYSIS_PAGE_SIZE;
-
-function loadMoreAmounts() {
-    amountsPageSize += ANALYSIS_PAGE_SIZE;
-    renderAmounts(document.getElementById("analysisContent"));
-}
-
-function loadMoreTransfers() {
-    transfersPageSize += ANALYSIS_PAGE_SIZE;
-    renderTransfers(document.getElementById("analysisContent"));
-}
-
-function loadMoreButtonHtml(shownCount, totalCount, onClickFnName) {
-    if (shownCount >= totalCount) return "";
-    const remaining = totalCount - shownCount;
-    return `<div class="load-more-row">
-        <button class="btn small" onclick="${onClickFnName}()">Load ${Math.min(remaining, ANALYSIS_PAGE_SIZE)} more (${remaining} remaining)</button>
-    </div>`;
-}
 
 // value used to compare two rows for a given sort key - "amount" prefers the USD-equivalent
 // when available (so mixed-currency lists still sort meaningfully), falling back to the raw
@@ -2830,13 +3149,11 @@ function toggleSort(state, key) {
 
 function setAmountsSort(key) {
     toggleSort(amountsSort, key);
-    amountsPageSize = ANALYSIS_PAGE_SIZE;
     renderAmounts(document.getElementById("analysisContent"));
 }
 
 function setTransfersSort(key) {
     toggleSort(transfersSort, key);
-    transfersPageSize = ANALYSIS_PAGE_SIZE;
     renderTransfers(document.getElementById("analysisContent"));
 }
 
@@ -2867,8 +3184,6 @@ function clearAnalysisSearch() {
 // Re-renders the current tab from already-fetched data (no network round-trip per
 // keystroke). Falls back to a full load if nothing's cached yet for that tab.
 function reapplyAnalysisSearch() {
-    amountsPageSize = ANALYSIS_PAGE_SIZE;
-    transfersPageSize = ANALYSIS_PAGE_SIZE;
     const container = document.getElementById("analysisContent");
     if (currentAnalysisTab === "addresses") { if (cachedAddresses) renderAddresses(container); else loadAddresses(container); }
     else if (currentAnalysisTab === "amounts") { if (cachedAmounts) renderAmounts(container); else loadAmounts(container); }
@@ -2924,7 +3239,6 @@ function refreshHiddenWalletsSidebar() {
 function loadAmounts(container) {
     fetch("/analysis/amounts" + suspectsQueryParam()).then(r => r.json()).then(data => {
         cachedAmounts = data;
-        amountsPageSize = ANALYSIS_PAGE_SIZE;
         renderAmounts(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
@@ -2949,10 +3263,9 @@ function renderAmounts(container) {
     const sortNote = amountsSort.key
         ? `sorted by ${amountsSort.key} (${amountsSort.dir === "asc" ? "ascending" : "descending"})`
         : "sorted largest to smallest (USD-equivalent first when available)";
-    const page = filtered.slice(0, amountsPageSize);
-    let html = `<div class="results-note">${page.length} of ${filtered.length} matching transaction(s) shown (${data.length} total), ${sortNote}. Click a column header to sort.</div>`;
+    let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, ${sortNote}. Click a column header to sort.</div>`;
     html += `<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th>${sortableTh("Amount", "amount", amountsSort, "setAmountsSort")}${sortableTh("Date", "date", amountsSort, "setAmountsSort")}<th>Address flow</th><th>TXID</th></tr></thead><tbody>`;
-    page.forEach(r => {
+    filtered.forEach(r => {
         // Money's real-world direction flips the FROM/TO meaning of the same two columns:
         // a deposit's external address is the sender (FROM) and the exchange's own address is
         // the receiver (TO); a withdrawal is the mirror image.
@@ -2974,14 +3287,12 @@ function renderAmounts(container) {
         </tr>`;
     });
     html += "</tbody></table></div>";
-    html += loadMoreButtonHtml(page.length, filtered.length, "loadMoreAmounts");
     container.innerHTML = html;
 }
 
 function loadTransfers(container) {
     fetch("/analysis/transfers" + suspectsQueryParam()).then(r => r.json()).then(data => {
         cachedTransfers = data;
-        transfersPageSize = ANALYSIS_PAGE_SIZE;
         renderTransfers(container);
     }).catch(err => {
         container.innerHTML = `<div class="analysis-empty">Error loading data: ${escapeHtml(String(err))}</div>`;
@@ -3167,16 +3478,14 @@ function renderTransfers(container) {
     }
 
     const txidCount = matched.filter(p => p.match_type === "txid").length;
-    const matchedPage = matched.slice(0, transfersPageSize);
 
     html += `<div class="results-note">
-        ${matchedPage.length} of ${matched.length}${(analysisSearchQuery || transferPersonFilter !== "all") ? ` (${allMatched.length} total)` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
+        ${matched.length}${(analysisSearchQuery || transferPersonFilter !== "all") ? ` of ${allMatched.length}` : ""} confirmed transfer(s) shown — <b>${txidCount}</b> proven by matching <b>TXID</b> (same blockchain tx on both sides),
         ${matched.length - txidCount} inferred from a shared address.
         ${unmatched.length ? `${unmatched.length} movement(s) could not be confidently paired — see below.` : ""}
     </div>`;
 
-    matchedPage.forEach(p => { html += transferCardHtml(p); });
-    html += loadMoreButtonHtml(matchedPage.length, matched.length, "loadMoreTransfers");
+    matched.forEach(p => { html += transferCardHtml(p); });
 
     if (unmatched.length) {
         html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
@@ -3228,10 +3537,6 @@ function loadGraph(container) {
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterCross" ${graphColorFilters.cross ? "checked" : ""} onchange="setGraphColorFilter('cross', this.checked)"> <span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</label>
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterSame" ${graphColorFilters.same ? "checked" : ""} onchange="setGraphColorFilter('same', this.checked)"> <span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</label>
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
-            </div>
-            <div class="graph-export-actions">
-                <button class="btn small" onclick="copyGraphImage()">📋 Copy graph</button>
-                <button class="btn small" onclick="exportGraphPng()">💾 Save as PNG</button>
             </div>
         </div>
         <div class="graph-canvas-wrap">
@@ -3434,35 +3739,6 @@ function hideGraphEdgeDetail() {
     if (panel) panel.style.display = "none";
 }
 
-// Framed to fit everything right before capturing, so the exported/copied image always
-// shows the whole graph rather than whatever crop the user happened to be zoomed/panned to.
-function graphCanvasElement() {
-    if (!graphNetworkInstance) { showToast("No graph to export yet", true); return null; }
-    graphNetworkInstance.fit({ animation: false });
-    return graphNetworkInstance.canvas.frame.canvas;
-}
-
-function exportGraphPng() {
-    const canvas = graphCanvasElement();
-    if (!canvas) return;
-    const link = document.createElement("a");
-    link.download = "cryptolink_graph.png";
-    link.href = canvas.toDataURL("image/png");
-    link.click();
-}
-
-function copyGraphImage() {
-    const canvas = graphCanvasElement();
-    if (!canvas) return;
-    canvas.toBlob(blob => {
-        if (!blob) { showToast("Couldn't create an image of the graph", true); return; }
-        navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
-            () => showToast("Graph copied to clipboard", false),
-            () => showToast("Couldn't copy to clipboard - your browser may not support this", true)
-        );
-    });
-}
-
 // Graph tab has no per-row list to filter, so the shared search box instead selects and
 // centers on the matching wallet node (by address) or, failing that, the matching
 // TXID-confirmed edge - same search box, same query, adapted to a graph instead of a table.
@@ -3589,7 +3865,7 @@ function suspectsQueryParam() {
     return isFiltered ? `?suspects=${selected.join(",")}` : "";
 }
 
-function triggerExport() {
+function triggerExport(fmt) {
     const allIds = Object.keys(suspects);
     const selected = Array.from(suspectFilterSelected);
 
@@ -3598,7 +3874,7 @@ function triggerExport() {
         return;
     }
 
-    window.location.href = `/export/xlsx${suspectsQueryParam()}`;
+    window.location.href = `/export/${fmt}${suspectsQueryParam()}`;
 }
 
 
