@@ -3434,32 +3434,40 @@ function hideGraphEdgeDetail() {
     if (panel) panel.style.display = "none";
 }
 
-// Framed to fit everything right before capturing, so the exported/copied image always
-// shows the whole graph rather than whatever crop the user happened to be zoomed/panned to.
-function graphCanvasElement() {
-    if (!graphNetworkInstance) { showToast("No graph to export yet", true); return null; }
+// Frames the whole graph right before capturing (so the exported/copied image isn't cropped
+// to whatever the user happened to be zoomed/panned to), then puts their view back exactly
+// where it was. fit() redraws on the next animation frame, not immediately, so the callback
+// has to wait for that frame before reading the canvas - otherwise it'd capture the view
+// from just before the fit.
+function withFullGraphView(callback) {
+    if (!graphNetworkInstance) { showToast("No graph to export yet", true); return; }
+    const savedPosition = graphNetworkInstance.getViewPosition();
+    const savedScale = graphNetworkInstance.getScale();
     graphNetworkInstance.fit({ animation: false });
-    return graphNetworkInstance.canvas.frame.canvas;
+    requestAnimationFrame(() => {
+        callback(graphNetworkInstance.canvas.frame.canvas);
+        graphNetworkInstance.moveTo({ position: savedPosition, scale: savedScale, animation: false });
+    });
 }
 
 function exportGraphPng() {
-    const canvas = graphCanvasElement();
-    if (!canvas) return;
-    const link = document.createElement("a");
-    link.download = "cryptolink_graph.png";
-    link.href = canvas.toDataURL("image/png");
-    link.click();
+    withFullGraphView(canvas => {
+        const link = document.createElement("a");
+        link.download = "cryptolink_graph.png";
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+    });
 }
 
 function copyGraphImage() {
-    const canvas = graphCanvasElement();
-    if (!canvas) return;
-    canvas.toBlob(blob => {
-        if (!blob) { showToast("Couldn't create an image of the graph", true); return; }
-        navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
-            () => showToast("Graph copied to clipboard", false),
-            () => showToast("Couldn't copy to clipboard - your browser may not support this", true)
-        );
+    withFullGraphView(canvas => {
+        canvas.toBlob(blob => {
+            if (!blob) { showToast("Couldn't create an image of the graph", true); return; }
+            navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
+                () => showToast("Graph copied to clipboard", false),
+                () => showToast("Couldn't copy to clipboard - your browser may not support this", true)
+            );
+        });
     });
 }
 
