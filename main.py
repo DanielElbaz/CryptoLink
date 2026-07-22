@@ -1501,7 +1501,7 @@ HTML_PAGE = """
         --input-bg: #ffffff; --hover-bg: #eef1f6; --dropzone-hover-bg: #eaf0ff; --nested-bg: #f7f8fb;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh;zoom: 1.15; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
     .container { max-width: 1440px; margin: 0 auto; padding: 32px 20px 100px; }
     header { margin-bottom: 24px; }
     header h1 { font-size: 26px; margin: 0 0 6px; font-weight: 600; }
@@ -1801,6 +1801,7 @@ HTML_PAGE = """
         margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
     }
     .graph-toggle { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .graph-export-actions { display: flex; gap: 8px; flex-shrink: 0; }
     .graph-legend { display: flex; gap: 14px; flex-wrap: wrap; }
     .legend-item { font-size: 11.5px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -3228,6 +3229,10 @@ function loadGraph(container) {
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterSame" ${graphColorFilters.same ? "checked" : ""} onchange="setGraphColorFilter('same', this.checked)"> <span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</label>
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
+            <div class="graph-export-actions">
+                <button class="btn small" onclick="copyGraphImage()">📋 Copy graph</button>
+                <button class="btn small" onclick="exportGraphPng()">💾 Save as PNG</button>
+            </div>
         </div>
         <div class="graph-canvas-wrap">
             <div id="graphCanvas"></div>
@@ -3427,6 +3432,35 @@ function showGraphEdgeDetail(edge) {
 function hideGraphEdgeDetail() {
     const panel = document.getElementById("graphEdgeDetail");
     if (panel) panel.style.display = "none";
+}
+
+// Framed to fit everything right before capturing, so the exported/copied image always
+// shows the whole graph rather than whatever crop the user happened to be zoomed/panned to.
+function graphCanvasElement() {
+    if (!graphNetworkInstance) { showToast("No graph to export yet", true); return null; }
+    graphNetworkInstance.fit({ animation: false });
+    return graphNetworkInstance.canvas.frame.canvas;
+}
+
+function exportGraphPng() {
+    const canvas = graphCanvasElement();
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = "cryptolink_graph.png";
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+}
+
+function copyGraphImage() {
+    const canvas = graphCanvasElement();
+    if (!canvas) return;
+    canvas.toBlob(blob => {
+        if (!blob) { showToast("Couldn't create an image of the graph", true); return; }
+        navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
+            () => showToast("Graph copied to clipboard", false),
+            () => showToast("Couldn't copy to clipboard - your browser may not support this", true)
+        );
+    });
 }
 
 // Graph tab has no per-row list to filter, so the shared search box instead selects and
