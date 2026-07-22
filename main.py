@@ -559,6 +559,8 @@ def compute_addresses_analysis(suspect_ids=None):
                 "currency": o["currency"],
                 "date": o["date"].isoformat() if o["date"] is not None else None,
                 "txid": o["txid"], "exchange_address": o["exchange_address"],
+                "exchange_address_category": KNOWN_WALLETS.get((o["exchange_address"] or "").lower(), {}).get("category", ""),
+                "exchange_address_category_color": KNOWN_WALLETS.get((o["exchange_address"] or "").lower(), {}).get("category_color", ""),
             } for o in occurrences],
         })
 
@@ -630,15 +632,21 @@ def compute_amounts_analysis(suspect_ids=None):
 
     rows.sort(key=sort_key, reverse=True)
 
+    def _cat(address):
+        return KNOWN_WALLETS.get((address or "").lower(), {})
+
     return [{
         "suspect_name": r["suspect_name"], "exchange": r["exchange"], "file_type": r["file_type"],
         "amount": r["amount"], "amount_usd": r["amount_usd"], "currency": r["currency"],
         "date": r["date"].isoformat() if r["date"] is not None else None,
         "external_address": r["external_address"], "exchange_address": r["exchange_address"], "txid": r["txid"],
         # Same persistent cross-case category lookup used by compute_addresses_analysis - a
-        # wallet tagged from any tab shows the same badge here too.
-        "category": KNOWN_WALLETS.get((r["external_address"] or "").lower(), {}).get("category", ""),
-        "category_color": KNOWN_WALLETS.get((r["external_address"] or "").lower(), {}).get("category_color", ""),
+        # wallet tagged from any tab shows the same badge here too. Both addresses on the row
+        # can be tagged independently (e.g. the external wallet AND the exchange's own address).
+        "category": _cat(r["external_address"]).get("category", ""),
+        "category_color": _cat(r["external_address"]).get("category_color", ""),
+        "exchange_address_category": _cat(r["exchange_address"]).get("category", ""),
+        "exchange_address_category_color": _cat(r["exchange_address"]).get("category_color", ""),
     } for r in rows]
 
 
@@ -649,12 +657,15 @@ def analysis_amounts():
 
 def _transfer_side(o):
     known = KNOWN_WALLETS.get((o["external_address"] or "").lower(), {})
+    exchange_known = KNOWN_WALLETS.get((o["exchange_address"] or "").lower(), {})
     return {
         "suspect_id": o["suspect_id"], "suspect_name": o["suspect_name"], "exchange": o["exchange"],
         "amount": o["amount"], "amount_usd": o["amount_usd"], "currency": o["currency"],
         "date": o["date"].isoformat(), "txid": o["txid"],
         "external_address": o["external_address"], "exchange_address": o["exchange_address"],
         "category": known.get("category", ""), "category_color": known.get("category_color", ""),
+        "exchange_address_category": exchange_known.get("category", ""),
+        "exchange_address_category_color": exchange_known.get("category_color", ""),
     }
 
 
@@ -2783,7 +2794,7 @@ function renderAddresses(container) {
                         <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
                         <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
                         <td>${fmtDate(o.date)}</td>
-                        <td>${o.exchange_address ? truncMono(o.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</td>
+                        <td>${o.exchange_address ? truncMono(o.exchange_address) + " " + categoryBadgeHtml(o.exchange_address, o.exchange_address_category, o.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</td>
                         <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
                     </tr>`).join("")}
                     </tbody></table>
@@ -3244,7 +3255,7 @@ function renderAmounts(container) {
             <td>
                 <div class="flow-line"><span class="flow-tag">${addrLabel}</span> ${truncMono(r.external_address)} ${categoryBadgeHtml(r.external_address, r.category, r.category_color)}</div>
                 <div class="flow-arrow">⇄</div>
-                <div class="flow-line"><span class="flow-tag">${exAddrLabel}</span> ${r.exchange_address ? truncMono(r.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</div>
+                <div class="flow-line"><span class="flow-tag">${exAddrLabel}</span> ${r.exchange_address ? truncMono(r.exchange_address) + " " + categoryBadgeHtml(r.exchange_address, r.exchange_address_category, r.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</div>
             </td>
             <td>${truncMono(r.txid)}</td>
         </tr>`;
@@ -3289,7 +3300,7 @@ function transferCardHtml(p) {
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
                 <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(w.external_address || "-")}</span> ${categoryBadgeHtml(w.external_address, w.category, w.category_color)}</div>
-                ${w.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(w.exchange_address)}</span></div>` : ""}
+                ${w.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(w.exchange_address)}</span> ${categoryBadgeHtml(w.exchange_address, w.exchange_address_category, w.exchange_address_category_color)}</div>` : ""}
             </div>
             <div class="transfer-arrow">→</div>
             <div class="transfer-side">
@@ -3300,7 +3311,7 @@ function transferCardHtml(p) {
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
                 <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(d.external_address || "-")}</span> ${categoryBadgeHtml(d.external_address, d.category, d.category_color)}</div>
-                ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span></div>` : ""}
+                ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span> ${categoryBadgeHtml(d.exchange_address, d.exchange_address_category, d.exchange_address_category_color)}</div>` : ""}
             </div>
         </div>
         <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
@@ -3433,8 +3444,8 @@ function renderTransfers(container) {
                 <td>${escapeHtml(u.exchange)}</td>
                 <td>${fmtAmount(u.amount, u.currency)}</td>
                 <td>${fmtDate(u.date)}</td>
-                <td>${truncMono(u.address)}</td>
-                <td>${u.exchange_address ? truncMono(u.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</td>
+                <td>${truncMono(u.address)} ${categoryBadgeHtml(u.address, u.category, u.category_color)}</td>
+                <td>${u.exchange_address ? truncMono(u.exchange_address) + " " + categoryBadgeHtml(u.exchange_address, u.exchange_address_category, u.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</td>
                 <td>${truncMono(u.txid)}</td>
             </tr>`;
         });
