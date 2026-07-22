@@ -1425,6 +1425,7 @@ def compute_graph_data(suspect_ids=None):
             agg = by_suspect.setdefault(key, {
                 "suspect_name": o["suspect_name"], "count": 0,
                 "deposits": 0, "withdrawals": 0, "total_usd": 0.0, "exchanges": set(),
+                "transactions": [],
             })
             agg["count"] += 1
             agg["exchanges"].add(o["exchange"])
@@ -1434,6 +1435,15 @@ def compute_graph_data(suspect_ids=None):
                 agg["withdrawals"] += 1
             if o["amount_usd"]:
                 agg["total_usd"] += o["amount_usd"]
+            # Kept so clicking this edge in the Graph tab can list the actual transactions
+            # behind it, instead of just the aggregated count/title.
+            agg["transactions"].append({
+                # o["date"] is already an ISO string here - compute_addresses_analysis
+                # converts it before compute_graph_data ever sees these occurrences.
+                "exchange": o["exchange"], "file_type": o["file_type"],
+                "amount": o["amount"], "amount_usd": o["amount_usd"], "currency": o["currency"],
+                "date": o["date"], "txid": o["txid"],
+            })
 
         for suspect_id, agg in by_suspect.items():
             suspect_node_id = f"suspect:{suspect_id}"
@@ -1457,6 +1467,8 @@ def compute_graph_data(suspect_ids=None):
             edges.append({
                 "from": suspect_node_id, "to": addr_id,
                 "value": agg["count"], "title": title, "arrows": arrows,
+                "suspect_name": agg["suspect_name"], "address": item["address"],
+                "transactions": agg["transactions"],
             })
 
     # Direct suspect-to-suspect edges for TXID-confirmed transfers between two different
@@ -1475,6 +1487,7 @@ def compute_graph_data(suspect_ids=None):
             "from": f"suspect:{w['suspect_id']}", "to": f"suspect:{d['suspect_id']}",
             "value": 3, "color": {"color": "#3ecf8e"}, "arrows": {"to": {"enabled": True}},
             "title": f"Confirmed transfer (same TXID {w['txid']}) — {w['amount']} {w['currency']} on {w['exchange']} → {d['exchange']}",
+            "transfer": p,
         })
 
     return {"nodes": list(nodes.values()), "edges": edges}
@@ -2149,6 +2162,10 @@ HTML_PAGE = """
         position: absolute; display: none; gap: 4px; background: var(--bg-card);
         border: 1px solid var(--border); border-radius: 6px; padding: 4px;
         box-shadow: 0 6px 18px rgba(0,0,0,0.35); z-index: 10;
+    }
+    .graph-edge-detail {
+        margin-top: 16px; background: var(--bg-card); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 14px 16px;
     }
 
     .analysis-layout { display: flex; gap: 20px; align-items: flex-start; }
@@ -3286,6 +3303,7 @@ function loadTransfers(container) {
 // and the Chains tab (several of these stacked per chain, connected by transferChainLinkHtml).
 function transferCardHtml(p) {
     const w = p.withdrawal, d = p.deposit;
+    const contextAddress = p.address || w.external_address || d.external_address;
     const who = p.same_suspect
         ? `<b>${escapeHtml(w.suspect_name)}</b> sent to themself`
         : `<b>${escapeHtml(w.suspect_name)}</b> sent to <b>${escapeHtml(d.suspect_name)}</b>`;
@@ -3323,8 +3341,34 @@ function transferCardHtml(p) {
                 ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span> ${categoryBadgeHtml(d.exchange_address, d.exchange_address_category, d.exchange_address_category_color)}</div>` : ""}
             </div>
         </div>
-        <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
+        <div class="transfer-gap">
+            Time gap: ${p.gap_hours} hour(s)
+            ${contextAddress ? `<button class="btn small" style="margin-left:10px;" onclick="viewWalletHistory('${escapeHtml(contextAddress).replace(/'/g, "\\'")}')">🔍 View this wallet's history</button>` : ""}
+        </div>
     </div>`;
+}
+
+// Jumps to Amounts, pre-filtered to just this wallet address (clearing any other filter/
+// search) so the transactions right before and after this transfer are easy to see for
+// context - what else moved through this same wallet, on either side of it.
+function viewWalletHistory(address) {
+    if (!address) return;
+    analysisSearchQuery = "";
+    document.getElementById("analysisSearch").value = "";
+    document.getElementById("analysisSearchClear").style.display = "none";
+
+    analysisFilters = { dateFrom: "", dateTo: "", address: address.trim().toLowerCase(), txid: "", exchanges: new Set() };
+    document.getElementById("filterDateFrom").value = "";
+    document.getElementById("filterDateTo").value = "";
+    document.getElementById("filterTxid").value = "";
+    document.getElementById("filterAddress").value = address;
+    document.getElementById("analysisFilterPanel").style.display = "block";
+    renderFilterExchangeList();
+    const filterBtn = document.getElementById("analysisFilterToggleBtn");
+    filterBtn.textContent = "🔎 Filters (1) ▾";
+    filterBtn.classList.add("active");
+
+    switchAnalysisTab("amounts");
 }
 
 function loadChains(container) {
@@ -3472,10 +3516,22 @@ let cachedGraphData = null;
 
 let graphColorFilters = { cross: true, same: true };
 
+// Node drag positions, persisted in localStorage (keyed by node id, which embeds the
+// suspect's UUID or the address so it's stable across reloads and Save/Load case) so
+// rearranging the graph isn't lost on a tab switch or a page refresh.
+function loadGraphNodePositions() {
+    try { return JSON.parse(localStorage.getItem("cryptolink-graph-positions") || "{}"); }
+    catch { return {}; }
+}
+function saveGraphNodePositions() {
+    localStorage.setItem("cryptolink-graph-positions", JSON.stringify(graphNodePositions));
+}
+let graphNodePositions = loadGraphNodePositions();
+
 function loadGraph(container) {
     container.innerHTML = `
         <div class="graph-controls">
-            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Arrows show the direction money moved. Hover a wallet node for actions.</div>
+            <div class="results-note" style="margin-bottom:0;">Only accounts linked by a shared wallet or a confirmed TXID transfer are shown. Arrows show the direction money moved. Hover a wallet node for actions, click an arrow to see the transactions behind it.</div>
             <div class="graph-legend">
                 <span class="legend-item"><span class="legend-dot" style="background:#4f8cff;"></span> Suspect</span>
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterCross" ${graphColorFilters.cross ? "checked" : ""} onchange="setGraphColorFilter('cross', this.checked)"> <span class="legend-dot" style="background:#f0556b;"></span> Wallet shared between different people</label>
@@ -3491,6 +3547,7 @@ function loadGraph(container) {
                 <button class="icon-btn danger" title="Hide this wallet" onclick="hideWallet(document.getElementById('graphNodeToolbar').dataset.address)">🗑️</button>
             </div>
         </div>
+        <div id="graphEdgeDetail" class="graph-edge-detail" style="display:none;"></div>
     `;
 
     const toolbar = document.getElementById("graphNodeToolbar");
@@ -3519,6 +3576,7 @@ function renderGraph() {
     if (!data || !canvas) return;
 
     if (graphNetworkInstance) { graphNetworkInstance.destroy(); graphNetworkInstance = null; }
+    hideGraphEdgeDetail();
 
     if (!data.nodes.length) {
         canvas.innerHTML = '<div class="analysis-empty">No wallet connects two different accounts yet.</div>';
@@ -3549,6 +3607,14 @@ function renderGraph() {
     }
     canvas.innerHTML = "";
 
+    // Apply any positions saved from a previous drag (this session or a past one) and pin
+    // them so the initial physics pass doesn't shuffle them - new nodes with no saved
+    // position are left for physics to place normally, next to their now-fixed neighbors.
+    visibleNodes.forEach(n => {
+        const pos = graphNodePositions[n.id];
+        if (pos) { n.x = pos.x; n.y = pos.y; n.fixed = { x: true, y: true }; }
+    });
+
     const nodes = new vis.DataSet(visibleNodes);
     const edges = new vis.DataSet(visibleEdges);
     const isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
@@ -3578,6 +3644,34 @@ function renderGraph() {
     // one node repositions just that node instead of the whole graph reacting/reshuffling.
     graphNetworkInstance.once("stabilizationIterationsDone", () => {
         graphNetworkInstance.setOptions({ physics: false });
+        // Capture where everything landed (including brand-new nodes physics just placed)
+        // so the next render - another tab and back, or a page refresh - starts from here
+        // instead of re-running physics from scratch.
+        const allPositions = graphNetworkInstance.getPositions();
+        Object.assign(graphNodePositions, allPositions);
+        saveGraphNodePositions();
+        // Release nodes that were pinned to a saved position - they should stay draggable,
+        // not frozen in place now that physics is off anyway.
+        nodes.get().forEach(n => {
+            if (n.fixed) nodes.update({ id: n.id, fixed: { x: false, y: false } });
+        });
+    });
+
+    // Persist wherever a node ends up after a manual drag, so the layout survives a tab
+    // switch or a full page refresh instead of resetting to a fresh physics layout.
+    graphNetworkInstance.on("dragEnd", params => {
+        if (!params.nodes.length) return;
+        const positions = graphNetworkInstance.getPositions(params.nodes);
+        Object.assign(graphNodePositions, positions);
+        saveGraphNodePositions();
+    });
+
+    // Click a suspect<->wallet or confirmed-transfer edge to see the actual transactions
+    // behind it, listed below the graph.
+    graphNetworkInstance.on("click", params => {
+        if (params.nodes.length) return;
+        if (params.edges.length) showGraphEdgeDetail(edges.get(params.edges[0]));
+        else hideGraphEdgeDetail();
     });
 
     // Hover a wallet node -> show a small floating copy/hide toolbar next to it (suspect
@@ -3609,6 +3703,40 @@ function scheduleHideGraphToolbar() {
         const toolbar = document.getElementById("graphNodeToolbar");
         if (toolbar) toolbar.style.display = "none";
     }, 250);
+}
+
+// Shows the transactions behind a clicked edge in a panel below the graph - a confirmed
+// TXID transfer reuses the same transfer-card markup as the Transfers tab, a suspect<->wallet
+// edge gets a small table of every transaction aggregated into that edge.
+function showGraphEdgeDetail(edge) {
+    const panel = document.getElementById("graphEdgeDetail");
+    if (!panel) return;
+
+    if (edge.transfer) {
+        panel.innerHTML = `<div class="panel-title">Confirmed transfer</div>${transferCardHtml(edge.transfer)}`;
+    } else if (edge.transactions) {
+        const rows = (edge.transactions || []).slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+        panel.innerHTML = `
+            <div class="panel-title">${rows.length} transaction(s) between ${escapeHtml(edge.suspect_name)} and ${truncMono(edge.address)}</div>
+            <div class="table-wrap"><table><thead><tr><th>Type</th><th>Exchange</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                ${rows.map(o => `<tr>
+                    <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
+                    <td>${escapeHtml(o.exchange)}</td>
+                    <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
+                    <td>${fmtDate(o.date)}</td>
+                    <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
+                </tr>`).join("")}
+            </tbody></table></div>
+        `;
+    } else {
+        return;
+    }
+    panel.style.display = "block";
+}
+
+function hideGraphEdgeDetail() {
+    const panel = document.getElementById("graphEdgeDetail");
+    if (panel) panel.style.display = "none";
 }
 
 // Graph tab has no per-row list to filter, so the shared search box instead selects and
