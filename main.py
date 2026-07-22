@@ -539,6 +539,12 @@ def compute_addresses_analysis(suspect_ids=None):
             # /known_wallets/commit) - a wallet with almost no data in the current case can
             # still surface a match against everything ever investigated before.
             "known_sightings": KNOWN_WALLETS.get(addr_lower, {}).get("sightings", []),
+            # Free-text label (e.g. "Binance hot wallet", "Mixer") + optional badge color, set
+            # manually per-wallet and stored in the same persistent cross-case ledger as
+            # sightings - so it's shown next to this address everywhere it recurs, in this
+            # case and any future one.
+            "category": KNOWN_WALLETS.get(addr_lower, {}).get("category", ""),
+            "category_color": KNOWN_WALLETS.get(addr_lower, {}).get("category_color", ""),
             "occurrence_count": len(occurrences),
             "distinct_accounts": len(distinct_combos),
             "is_cross_account": len(distinct_combos) > 1,
@@ -1736,6 +1742,41 @@ def commit_known_wallets():
     })
 
 
+@app.route("/known_wallets/category", methods=["POST"])
+def set_known_wallet_category():
+    """Manually tags a single wallet with a free-text category + optional badge color, stored
+    in the same persistent cross-case ledger as commit_known_wallets(). Unlike that bulk
+    action, this works one address at a time and doesn't require the address to already have
+    any data in the current case - typing in an address here is enough to permanently add it
+    to the database (setdefault creates the entry), which is also how a wallet gets added to
+    the ledger "manually" without going through a whole case."""
+    data = request.get_json() or {}
+    address = (data.get("address") or "").strip()
+    addr_lower = address.lower()
+    if not addr_lower:
+        return jsonify({"error": "Address required"}), 400
+
+    category = (data.get("category") or "").strip()
+    color = (data.get("color") or "").strip()
+
+    if category or color:
+        entry = KNOWN_WALLETS.setdefault(addr_lower, {"address": address, "sightings": []})
+        entry["category"] = category
+        entry["category_color"] = color
+    else:
+        # Clearing the category on a wallet that was only ever known for that category (never
+        # committed with real sightings) leaves nothing worth keeping - drop it entirely.
+        entry = KNOWN_WALLETS.get(addr_lower)
+        if entry:
+            entry["category"] = ""
+            entry["category_color"] = ""
+            if not entry.get("sightings"):
+                del KNOWN_WALLETS[addr_lower]
+
+    _save_known_wallets()
+    return jsonify({"success": True, "address": address, "category": category, "category_color": color})
+
+
 _load_known_wallets()
 
 
@@ -1959,6 +2000,18 @@ HTML_PAGE = """
     }
     .known-sightings-title { font-size: 12px; font-weight: 600; color: #a78bfa; margin-bottom: 8px; }
     .known-sightings-box table { font-size: 12px; }
+    .category-badge {
+        display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px;
+        font-weight: 700; color: #fff; margin-left: 8px; cursor: pointer;
+    }
+    .category-badge-placeholder {
+        display: inline-block; font-size: 11px; color: var(--text-dim); margin-left: 8px;
+        cursor: pointer; opacity: 0; transition: opacity 0.1s;
+    }
+    .addr-row:hover .category-badge-placeholder { opacity: 1; }
+    .category-edit-row { display: flex; gap: 8px; align-items: center; }
+    .category-edit-row input[type="text"] { flex: 1; }
+    .category-edit-row input[type="color"] { width: 36px; height: 30px; padding: 2px; cursor: pointer; }
 
     .addr-row { cursor: pointer; }
     .addr-detail-row td { background: var(--nested-bg); padding: 0; }
@@ -2172,6 +2225,18 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                 <div class="suspect-filter-actions">
                     <input type="text" id="knownWalletsLabel" placeholder="e.g. Q1 2026 fraud case" style="flex:1;">
                     <button class="btn small" onclick="commitKnownWallets()">Add</button>
+                </div>
+                <p style="margin:14px 0 8px;font-size:12.5px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:12px;">
+                    Or tag a single wallet manually - works even for an address with no data in the current case,
+                    and adds it to the database right away.
+                </p>
+                <div class="category-edit-row" style="margin-bottom:8px;">
+                    <input type="text" id="manualWalletAddress" placeholder="Wallet address">
+                    <input type="text" id="manualWalletCategory" placeholder="Category, e.g. Mixer">
+                    <input type="color" id="manualWalletColor" value="#4f8cff" title="Badge color">
+                </div>
+                <div class="suspect-filter-actions">
+                    <button class="btn small" onclick="addManualWalletCategory()">Save wallet</button>
                 </div>
             </div>
         </div>
@@ -2660,12 +2725,16 @@ function renderAddresses(container) {
             <td>
                 ${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}
                 ${sightings.length ? `<span class="known-elsewhere-badge" onclick="event.stopPropagation(); toggleAddrDetail('${esc}', ${idx})">👁 SEEN ELSEWHERE (${sightings.length})</span>` : ""}
+                ${item.category
+                    ? `<span class="category-badge" style="background:${escapeHtml(item.category_color || "#4f8cff")};" onclick="event.stopPropagation(); startAddressCategoryEdit('${esc}')" title="Click to edit category">🏷️ ${escapeHtml(item.category)}</span>`
+                    : `<span class="category-badge-placeholder" onclick="event.stopPropagation(); startAddressCategoryEdit('${esc}')">+ Categorize</span>`}
             </td>
         </tr>
         <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${isExpanded ? 'table-row' : 'none'};">
             <td colspan="4">
                 <div class="addr-detail-wrap">
                     ${addressNoteHtml(item)}
+                    ${addressCategoryHtml(item)}
                     ${sightings.length ? `<div class="known-sightings-box">
                         <div class="known-sightings-title">👁 Seen in ${sightings.length} previous investigation(s)</div>
                         <table><thead><tr><th>Case</th><th>Suspect</th><th>Exchange(s)</th><th>Occurrences</th><th>Last seen</th></tr></thead><tbody>
@@ -2765,6 +2834,71 @@ function saveAddressNote(address) {
         loadAddresses(document.getElementById("analysisContent"));
         refreshHiddenWalletsSidebar();
     });
+}
+
+// Free-text category (e.g. "Binance hot wallet", "Mixer") + optional badge color, attached
+// to a wallet address. Unlike the note above (per-case, purely informational), this is
+// stored in the persistent cross-case known-wallets ledger (see /known_wallets/category) -
+// so once a wallet is tagged, the same badge shows up next to it in any future case too.
+let editingAddressCategory = null;
+
+function addressCategoryHtml(item) {
+    const esc = escapeHtml(item.address).replace(/'/g, "\\'");
+    if (editingAddressCategory === item.address) {
+        const color = item.category_color || "#4f8cff";
+        return `<div class="suspect-note" onclick="event.stopPropagation()" style="padding:0 0 12px;">
+            <div class="category-edit-row">
+                <input type="text" id="addrCategoryInput" placeholder="e.g. Binance hot wallet, Mixer, Personal wallet..." value="${escapeHtml(item.category || "")}" maxlength="80">
+                <input type="color" id="addrCategoryColorInput" value="${escapeHtml(color)}" title="Badge color">
+            </div>
+            <div class="note-actions">
+                <button class="btn small" onclick="event.stopPropagation(); saveAddressCategory('${esc}')">Save</button>
+                ${item.category ? `<button class="btn small" onclick="event.stopPropagation(); clearAddressCategory('${esc}')">Remove</button>` : ""}
+                <button class="btn small" onclick="event.stopPropagation(); cancelAddressCategoryEdit()">Cancel</button>
+            </div>
+        </div>`;
+    }
+    return `<div class="suspect-note" onclick="event.stopPropagation(); startAddressCategoryEdit('${esc}')" style="padding:0 0 12px;">
+        ${item.category
+            ? `🏷️ <span class="category-badge" style="background:${escapeHtml(item.category_color || "#4f8cff")};">${escapeHtml(item.category)}</span>`
+            : '<span class="note-placeholder">+ Add category</span>'}
+    </div>`;
+}
+
+function startAddressCategoryEdit(address) {
+    editingAddressCategory = address;
+    expandedAddresses.add(address);
+    renderAddresses(document.getElementById("analysisContent"));
+    const inp = document.getElementById("addrCategoryInput");
+    if (inp) inp.focus();
+}
+
+function cancelAddressCategoryEdit() {
+    editingAddressCategory = null;
+    renderAddresses(document.getElementById("analysisContent"));
+}
+
+function saveAddressCategory(address) {
+    const category = document.getElementById("addrCategoryInput").value.trim();
+    const color = document.getElementById("addrCategoryColorInput").value;
+    fetch("/known_wallets/category", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, category, color })
+    }).then(() => {
+        editingAddressCategory = null;
+        loadAddresses(document.getElementById("analysisContent"));
+        showToast("Category saved", false);
+    }).catch(err => showToast("Network error saving category: " + err, true));
+}
+
+function clearAddressCategory(address) {
+    fetch("/known_wallets/category", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, category: "", color: "" })
+    }).then(() => {
+        editingAddressCategory = null;
+        loadAddresses(document.getElementById("analysisContent"));
+    }).catch(err => showToast("Network error removing category: " + err, true));
 }
 
 // Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
@@ -3463,6 +3597,23 @@ function commitKnownWallets() {
         document.getElementById("knownWalletsLabel").value = "";
         document.getElementById("knownWalletsPanel").style.display = "none";
         showToast(`Added ${data.wallet_count} wallet(s) to the database as "${data.case_label}"`, false);
+        if (currentMainTab === "analysis" && currentAnalysisTab === "addresses") loadAddresses(document.getElementById("analysisContent"));
+    }).catch(err => showToast("Network error: " + err, true));
+}
+
+function addManualWalletCategory() {
+    const address = document.getElementById("manualWalletAddress").value.trim();
+    const category = document.getElementById("manualWalletCategory").value.trim();
+    const color = document.getElementById("manualWalletColor").value;
+    if (!address) { showToast("Enter a wallet address first", true); return; }
+    fetch("/known_wallets/category", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, category, color })
+    }).then(r => r.json()).then(data => {
+        if (data.error) { showToast(data.error, true); return; }
+        document.getElementById("manualWalletAddress").value = "";
+        document.getElementById("manualWalletCategory").value = "";
+        showToast("Wallet added to the database", false);
         if (currentMainTab === "analysis" && currentAnalysisTab === "addresses") loadAddresses(document.getElementById("analysisContent"));
     }).catch(err => showToast("Network error: " + err, true));
 }
