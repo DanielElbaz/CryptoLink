@@ -509,6 +509,10 @@ def get_all_transactions(suspect_ids=None):
                 "amount_usd": _to_float(r.get("amount_usd")) if has_usd else None,
                 "txid": _clean_str(r.get("txid")),
                 "external_address": _clean_str(r.get("external_address")),
+                # The exchange's own side of the address pair (e.g. Matrix's "Recharge
+                # address"/"Withdrawal address" is external_address's counterpart on that same
+                # row) - purely informational, never used for suspect/wallet matching.
+                "exchange_address": _clean_str(r.get("exchange_address")),
             })
     return rows
 
@@ -548,7 +552,7 @@ def compute_addresses_analysis(suspect_ids=None):
                 "file_type": o["file_type"], "amount": o["amount"], "amount_usd": o["amount_usd"],
                 "currency": o["currency"],
                 "date": o["date"].isoformat() if o["date"] is not None else None,
-                "txid": o["txid"],
+                "txid": o["txid"], "exchange_address": o["exchange_address"],
             } for o in occurrences],
         })
 
@@ -624,7 +628,7 @@ def compute_amounts_analysis(suspect_ids=None):
         "suspect_name": r["suspect_name"], "exchange": r["exchange"], "file_type": r["file_type"],
         "amount": r["amount"], "amount_usd": r["amount_usd"], "currency": r["currency"],
         "date": r["date"].isoformat() if r["date"] is not None else None,
-        "external_address": r["external_address"], "txid": r["txid"],
+        "external_address": r["external_address"], "exchange_address": r["exchange_address"], "txid": r["txid"],
     } for r in rows]
 
 
@@ -638,6 +642,7 @@ def _transfer_side(o):
         "suspect_id": o["suspect_id"], "suspect_name": o["suspect_name"], "exchange": o["exchange"],
         "amount": o["amount"], "amount_usd": o["amount_usd"], "currency": o["currency"],
         "date": o["date"].isoformat(), "txid": o["txid"],
+        "external_address": o["external_address"], "exchange_address": o["exchange_address"],
     }
 
 
@@ -2673,13 +2678,14 @@ function renderAddresses(container) {
                         </tr>`).join("")}
                         </tbody></table>
                     </div>` : ""}
-                    <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>TXID</th></tr></thead><tbody>
+                    <table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Exchange address</th><th>TXID</th></tr></thead><tbody>
                     ${item.occurrences.map(o => `<tr>
                         <td>${escapeHtml(o.suspect_name)}</td>
                         <td>${escapeHtml(o.exchange)}</td>
                         <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
                         <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
                         <td>${fmtDate(o.date)}</td>
+                        <td>${o.exchange_address ? truncMono(o.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</td>
                         <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
                     </tr>`).join("")}
                     </tbody></table>
@@ -3039,7 +3045,7 @@ function renderAmounts(container) {
         ? `sorted by ${amountsSort.key} (${amountsSort.dir === "asc" ? "ascending" : "descending"})`
         : "sorted largest to smallest (USD-equivalent first when available)";
     let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, ${sortNote}. Click a column header to sort.</div>`;
-    html += `<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th>${sortableTh("Amount", "amount", amountsSort, "setAmountsSort")}${sortableTh("Date", "date", amountsSort, "setAmountsSort")}<th>Address</th><th>TXID</th></tr></thead><tbody>`;
+    html += `<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th>${sortableTh("Amount", "amount", amountsSort, "setAmountsSort")}${sortableTh("Date", "date", amountsSort, "setAmountsSort")}<th>Address</th><th>Exchange address</th><th>TXID</th></tr></thead><tbody>`;
     filtered.forEach(r => {
         html += `<tr>
             <td>${escapeHtml(r.suspect_name)}</td>
@@ -3048,6 +3054,7 @@ function renderAmounts(container) {
             <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
             <td>${fmtDate(r.date)}</td>
             <td>${truncMono(r.external_address)}</td>
+            <td>${r.exchange_address ? truncMono(r.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</td>
             <td>${truncMono(r.txid)}</td>
         </tr>`;
     });
@@ -3090,6 +3097,8 @@ function transferCardHtml(p) {
                 <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
+                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(w.external_address || "-")}</span></div>
+                ${w.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(w.exchange_address)}</span></div>` : ""}
             </div>
             <div class="transfer-arrow">→</div>
             <div class="transfer-side">
@@ -3099,6 +3108,8 @@ function transferCardHtml(p) {
                 <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
+                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(d.external_address || "-")}</span></div>
+                ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span></div>` : ""}
             </div>
         </div>
         <div class="transfer-gap">Time gap: ${p.gap_hours} hour(s)</div>
@@ -3223,7 +3234,7 @@ function renderTransfers(container) {
 
     if (unmatched.length) {
         html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
-        html += `<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th>${sortableTh("Amount", "amount", transfersSort, "setTransfersSort")}${sortableTh("Date", "date", transfersSort, "setTransfersSort")}<th>Address</th><th>TXID</th></tr></thead><tbody>`;
+        html += `<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th>${sortableTh("Amount", "amount", transfersSort, "setTransfersSort")}${sortableTh("Date", "date", transfersSort, "setTransfersSort")}<th>Address</th><th>Exchange address</th><th>TXID</th></tr></thead><tbody>`;
         unmatchedSorted.forEach(u => {
             html += `<tr>
                 <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
@@ -3232,6 +3243,7 @@ function renderTransfers(container) {
                 <td>${fmtAmount(u.amount, u.currency)}</td>
                 <td>${fmtDate(u.date)}</td>
                 <td>${truncMono(u.address)}</td>
+                <td>${u.exchange_address ? truncMono(u.exchange_address) : '<span style="color:var(--text-dim);">-</span>'}</td>
                 <td>${truncMono(u.txid)}</td>
             </tr>`;
         });
