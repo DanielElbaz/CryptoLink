@@ -2018,6 +2018,22 @@ HTML_PAGE = """
     .suspect-filter-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
     .suspect-filter-item input { cursor: pointer; }
 
+    .analysis-filter-panel {
+        background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 12px 14px; margin-bottom: 16px; max-width: 640px;
+    }
+    .filter-panel-row { display: flex; align-items: center; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+    .filter-panel-row:last-of-type { margin-bottom: 0; }
+    .filter-panel-row label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-dim); }
+    .filter-panel-row input[type="date"], .filter-panel-row input[type="text"] {
+        font-size: 12.5px; padding: 5px 8px; background: var(--input-bg); color: var(--text);
+        border: 1px solid var(--border); border-radius: 6px;
+    }
+    .filter-exchange-list { display: flex; flex-wrap: wrap; gap: 10px; }
+    .filter-exchange-item { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--text-dim); cursor: pointer; }
+    .filter-exchange-item input { cursor: pointer; }
+    #analysisFilterToggleBtn.active { background: var(--accent-dim); color: var(--btn-text); }
+
     .graph-controls {
         display: flex; justify-content: space-between; align-items: center;
         margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
@@ -2159,6 +2175,22 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                 <div class="search-row">
                     <input type="text" id="analysisSearch" placeholder="Search by wallet address or TXID..." oninput="onAnalysisSearch(this.value)">
                     <button class="btn small" id="analysisSearchClear" onclick="clearAnalysisSearch()" style="display:none;">Clear</button>
+                    <button class="btn small" id="analysisFilterToggleBtn" onclick="toggleAnalysisFilterPanel()">🔎 Filters ▾</button>
+                </div>
+                <div id="analysisFilterPanel" class="analysis-filter-panel" style="display:none;">
+                    <div class="filter-panel-row">
+                        <label>From <input type="date" id="filterDateFrom" onchange="onAnalysisFilterChange()"></label>
+                        <label>To <input type="date" id="filterDateTo" onchange="onAnalysisFilterChange()"></label>
+                        <label>Address contains <input type="text" id="filterAddress" placeholder="0xabc..." oninput="onAnalysisFilterChange()"></label>
+                        <label>TXID contains <input type="text" id="filterTxid" placeholder="abc123..." oninput="onAnalysisFilterChange()"></label>
+                    </div>
+                    <div class="filter-panel-row">
+                        <span class="filter-label">Exchange:</span>
+                        <div id="filterExchangeList" class="filter-exchange-list"></div>
+                    </div>
+                    <div class="suspect-filter-actions" style="margin-bottom:0;">
+                        <button class="btn small" onclick="clearAnalysisFilters()">Clear filters</button>
+                    </div>
                 </div>
                 <div class="sub-tabs">
                     <button class="tab-btn active" id="subTabAddresses" onclick="switchAnalysisTab('addresses')">Wallets</button>
@@ -2599,12 +2631,15 @@ function renderAddresses(container) {
         return;
     }
     // An address matches if its own text matches, or any of its occurrences' TXID does -
-    // the search field covers both wallet addresses and TXIDs per the same box.
+    // the search field covers both wallet addresses and TXIDs per the same box. The
+    // structured filter panel additionally requires at least one occurrence to fall within
+    // the chosen date range/exchange/address/txid.
     const filtered = data.filter(item =>
-        matchesSearch(item.address) || item.occurrences.some(o => matchesSearch(o.txid))
+        (matchesSearch(item.address) || item.occurrences.some(o => matchesSearch(o.txid))) &&
+        item.occurrences.some(o => matchesFilters({ date: o.date, exchange: o.exchange, address: item.address, txid: o.txid }))
     );
     if (!filtered.length) {
-        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        container.innerHTML = `<div class="analysis-empty">No address matches the current search/filters.</div>`;
         return;
     }
     let html = `<div class="results-note">${filtered.length} of ${data.length} distinct address(es) shown, sorted by frequency. Click a row to see all occurrences. Hover an address for actions - wallets that aren't relevant to your case can be hidden from Wallets, Transfers and the Graph.</div>`;
@@ -2730,6 +2765,96 @@ function saveAddressNote(address) {
 // highlighting/focusing a matching node instead of filtering a list).
 let analysisSearchQuery = "";
 let cachedAddresses = null, cachedAmounts = null, cachedTransfers = null, cachedChains = null;
+
+// Structured filter panel (Wallets/Amounts/Transfers/Chains) - date range, exchange,
+// address substring, TXID substring. Applied client-side on top of the free-text search,
+// same "no re-fetch" pattern as everything else in this file. exchanges is a Set: empty
+// means "no exchange restriction" (not "match nothing").
+let analysisFilters = { dateFrom: "", dateTo: "", address: "", txid: "", exchanges: new Set() };
+
+function toggleAnalysisFilterPanel() {
+    const panel = document.getElementById("analysisFilterPanel");
+    const isHidden = panel.style.display === "none";
+    panel.style.display = isHidden ? "block" : "none";
+    if (isHidden) renderFilterExchangeList();
+}
+
+// catalogData (populated on load and after every upload) already has one entry per
+// imported file with its detected exchange - cheaper and more reliable than scanning
+// whichever analysis tab happens to be cached.
+function getAvailableExchanges() {
+    const set = new Set();
+    Object.values(catalogData).forEach(f => { if (f.exchange) set.add(f.exchange); });
+    return Array.from(set).sort();
+}
+
+function renderFilterExchangeList() {
+    const list = document.getElementById("filterExchangeList");
+    const exchanges = getAvailableExchanges();
+    if (!exchanges.length) {
+        list.innerHTML = '<span style="font-size:12px;color:var(--text-dim);">No files imported yet.</span>';
+        return;
+    }
+    list.innerHTML = exchanges.map(ex => `
+        <label class="filter-exchange-item">
+            <input type="checkbox" ${analysisFilters.exchanges.has(ex) ? "checked" : ""} onchange="onExchangeFilterChange('${ex}', this.checked)">
+            ${escapeHtml(ex)}
+        </label>
+    `).join("");
+}
+
+function onExchangeFilterChange(exchange, checked) {
+    if (checked) analysisFilters.exchanges.add(exchange);
+    else analysisFilters.exchanges.delete(exchange);
+    applyAnalysisFilterState();
+}
+
+function onAnalysisFilterChange() {
+    analysisFilters.dateFrom = document.getElementById("filterDateFrom").value;
+    analysisFilters.dateTo = document.getElementById("filterDateTo").value;
+    analysisFilters.address = document.getElementById("filterAddress").value.trim().toLowerCase();
+    analysisFilters.txid = document.getElementById("filterTxid").value.trim().toLowerCase();
+    applyAnalysisFilterState();
+}
+
+function activeFilterCount() {
+    let n = 0;
+    if (analysisFilters.dateFrom) n++;
+    if (analysisFilters.dateTo) n++;
+    if (analysisFilters.address) n++;
+    if (analysisFilters.txid) n++;
+    if (analysisFilters.exchanges.size) n++;
+    return n;
+}
+
+function applyAnalysisFilterState() {
+    const count = activeFilterCount();
+    const btn = document.getElementById("analysisFilterToggleBtn");
+    btn.textContent = count ? `🔎 Filters (${count}) ▾` : "🔎 Filters ▾";
+    btn.classList.toggle("active", count > 0);
+    reapplyAnalysisSearch();
+}
+
+function clearAnalysisFilters() {
+    document.getElementById("filterDateFrom").value = "";
+    document.getElementById("filterDateTo").value = "";
+    document.getElementById("filterAddress").value = "";
+    document.getElementById("filterTxid").value = "";
+    analysisFilters = { dateFrom: "", dateTo: "", address: "", txid: "", exchanges: new Set() };
+    renderFilterExchangeList();
+    applyAnalysisFilterState();
+}
+
+// row: { date: ISO string or null, exchange, address, txid }
+function matchesFilters(row) {
+    const day = row.date ? row.date.slice(0, 10) : null;
+    if (analysisFilters.dateFrom && (!day || day < analysisFilters.dateFrom)) return false;
+    if (analysisFilters.dateTo && (!day || day > analysisFilters.dateTo)) return false;
+    if (analysisFilters.exchanges.size && !analysisFilters.exchanges.has(row.exchange)) return false;
+    if (analysisFilters.address && !(row.address || "").toLowerCase().includes(analysisFilters.address)) return false;
+    if (analysisFilters.txid && !(row.txid || "").toLowerCase().includes(analysisFilters.txid)) return false;
+    return true;
+}
 
 // Transfers tab: same person / different people filter, applied client-side on top of the
 // search filter (no re-fetch needed - the choice doesn't change what the server already sent).
@@ -2901,9 +3026,12 @@ function renderAmounts(container) {
         container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
         return;
     }
-    const searchFiltered = data.filter(r => matchesSearch(r.external_address) || matchesSearch(r.txid));
+    const searchFiltered = data.filter(r =>
+        (matchesSearch(r.external_address) || matchesSearch(r.txid)) &&
+        matchesFilters({ date: r.date, exchange: r.exchange, address: r.external_address, txid: r.txid })
+    );
     if (!searchFiltered.length) {
-        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        container.innerHTML = `<div class="analysis-empty">No transaction matches the current search/filters.</div>`;
         return;
     }
     const filtered = applySort(searchFiltered, amountsSort, sortValue);
@@ -2994,10 +3122,12 @@ function renderChains(container) {
     }
 
     const chains = allChains.filter(c => c.some(p =>
-        matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid)
+        (matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid)) &&
+        (matchesFilters({ date: p.withdrawal.date, exchange: p.withdrawal.exchange, address: p.address, txid: p.withdrawal.txid }) ||
+         matchesFilters({ date: p.deposit.date, exchange: p.deposit.exchange, address: p.address, txid: p.deposit.txid }))
     ));
     if (!chains.length) {
-        container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
+        container.innerHTML = `<div class="analysis-empty">No chain matches the current search/filters.</div>`;
         return;
     }
 
@@ -3041,8 +3171,18 @@ function renderTransfers(container) {
         return;
     }
 
-    const searchMatched = allMatched.filter(p => matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid));
-    const unmatched = allUnmatched.filter(u => matchesSearch(u.address) || matchesSearch(u.txid));
+    // A pair matches the filter panel if either leg (withdrawal or deposit) falls within the
+    // chosen date range/exchange - the two sides can land on different dates/exchanges, and
+    // hiding the whole transfer because one side misses would be more confusing than useful.
+    const searchMatched = allMatched.filter(p =>
+        (matchesSearch(p.address) || matchesSearch(p.withdrawal.txid) || matchesSearch(p.deposit.txid)) &&
+        (matchesFilters({ date: p.withdrawal.date, exchange: p.withdrawal.exchange, address: p.address, txid: p.withdrawal.txid }) ||
+         matchesFilters({ date: p.deposit.date, exchange: p.deposit.exchange, address: p.address, txid: p.deposit.txid }))
+    );
+    const unmatched = allUnmatched.filter(u =>
+        (matchesSearch(u.address) || matchesSearch(u.txid)) &&
+        matchesFilters({ date: u.date, exchange: u.exchange, address: u.address, txid: u.txid })
+    );
     const diffPeopleCount = searchMatched.filter(p => !p.same_suspect).length;
     const samePersonCount = searchMatched.length - diffPeopleCount;
 
