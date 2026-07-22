@@ -1988,6 +1988,8 @@ HTML_PAGE = """
 
     .results-note { font-size: 12.5px; color: var(--text-dim); margin-bottom: 12px; }
 
+    .sortable-th { cursor: pointer; user-select: none; white-space: nowrap; }
+    .sortable-th:hover { color: var(--text); }
     .person-filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
     .person-filter-row .filter-label { font-size: 12.5px; color: var(--text-dim); margin-right: 2px; }
     .filter-chip {
@@ -2743,6 +2745,68 @@ function setTransferPersonFilter(value) {
     renderTransfers(document.getElementById("analysisContent"));
 }
 
+// Date/Amount sorting for Amounts and Transfers, applied client-side on top of whatever
+// order the server returned (default order is preserved until the user actually clicks a
+// column, same "no re-fetch needed" pattern as search/person filter).
+let amountsSort = { key: null, dir: "desc" };
+let transfersSort = { key: null, dir: "desc" };
+
+// value used to compare two rows for a given sort key - "amount" prefers the USD-equivalent
+// when available (so mixed-currency lists still sort meaningfully), falling back to the raw
+// amount. Missing values sort last regardless of direction.
+function sortValue(row, key) {
+    if (key === "date") return row.date ? new Date(row.date).getTime() : null;
+    if (key === "amount") {
+        const v = row.amount_usd !== null && row.amount_usd !== undefined ? row.amount_usd : row.amount;
+        return v === null || v === undefined ? null : v;
+    }
+    return null;
+}
+
+function applySort(list, state, extractor) {
+    if (!state.key) return list;
+    const withIdx = list.map((item, i) => ({ item, i, v: extractor(item, state.key) }));
+    withIdx.sort((a, b) => {
+        if (a.v === null && b.v === null) return a.i - b.i;
+        if (a.v === null) return 1;   // missing values always last
+        if (b.v === null) return -1;
+        if (a.v !== b.v) return state.dir === "asc" ? a.v - b.v : b.v - a.v;
+        return a.i - b.i;  // stable tie-break
+    });
+    return withIdx.map(x => x.item);
+}
+
+function sortableTh(label, key, state, setterName) {
+    const active = state.key === key;
+    const arrow = active ? (state.dir === "asc" ? " ▲" : " ▼") : "";
+    return `<th class="sortable-th" onclick="${setterName}('${key}')">${escapeHtml(label)}${arrow}</th>`;
+}
+
+function sortChip(label, key, state, setterName) {
+    const active = state.key === key;
+    const arrow = active ? (state.dir === "asc" ? " ▲" : " ▼") : "";
+    return `<button class="filter-chip${active ? " active" : ""}" onclick="${setterName}('${key}')">${escapeHtml(label)}${arrow}</button>`;
+}
+
+// Matched transfer "cards" have no top-level date/amount (they're a withdrawal+deposit
+// pair) - sort by the withdrawal side, which is when the money actually moved.
+function transferSortValue(p, key) { return sortValue(p.withdrawal, key); }
+
+function toggleSort(state, key) {
+    if (state.key === key) { state.dir = state.dir === "asc" ? "desc" : "asc"; }
+    else { state.key = key; state.dir = "desc"; }
+}
+
+function setAmountsSort(key) {
+    toggleSort(amountsSort, key);
+    renderAmounts(document.getElementById("analysisContent"));
+}
+
+function setTransfersSort(key) {
+    toggleSort(transfersSort, key);
+    renderTransfers(document.getElementById("analysisContent"));
+}
+
 function matchesSearch(text) {
     if (!analysisSearchQuery) return true;
     return (text || "").toLowerCase().includes(analysisSearchQuery);
@@ -2837,13 +2901,17 @@ function renderAmounts(container) {
         container.innerHTML = '<div class="analysis-empty">No transactions found yet - import some files first.</div>';
         return;
     }
-    const filtered = data.filter(r => matchesSearch(r.external_address) || matchesSearch(r.txid));
-    if (!filtered.length) {
+    const searchFiltered = data.filter(r => matchesSearch(r.external_address) || matchesSearch(r.txid));
+    if (!searchFiltered.length) {
         container.innerHTML = `<div class="analysis-empty">No address or TXID matches "${escapeHtml(analysisSearchQuery)}".</div>`;
         return;
     }
-    let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, sorted largest to smallest (USD-equivalent first when available).</div>`;
-    html += '<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
+    const filtered = applySort(searchFiltered, amountsSort, sortValue);
+    const sortNote = amountsSort.key
+        ? `sorted by ${amountsSort.key} (${amountsSort.dir === "asc" ? "ascending" : "descending"})`
+        : "sorted largest to smallest (USD-equivalent first when available)";
+    let html = `<div class="results-note">${filtered.length} of ${data.length} transaction(s) shown, ${sortNote}. Click a column header to sort.</div>`;
+    html += `<div class="table-wrap"><table><thead><tr><th>Suspect</th><th>Exchange</th><th>Type</th>${sortableTh("Amount", "amount", amountsSort, "setAmountsSort")}${sortableTh("Date", "date", amountsSort, "setAmountsSort")}<th>Address</th><th>TXID</th></tr></thead><tbody>`;
     filtered.forEach(r => {
         html += `<tr>
             <td>${escapeHtml(r.suspect_name)}</td>
@@ -2978,17 +3046,21 @@ function renderTransfers(container) {
     const diffPeopleCount = searchMatched.filter(p => !p.same_suspect).length;
     const samePersonCount = searchMatched.length - diffPeopleCount;
 
-    const matched = searchMatched.filter(p =>
+    const matched = applySort(searchMatched.filter(p =>
         transferPersonFilter === "all" ||
         (transferPersonFilter === "same" && p.same_suspect) ||
         (transferPersonFilter === "different" && !p.same_suspect)
-    );
+    ), transfersSort, transferSortValue);
+    const unmatchedSorted = applySort(unmatched, transfersSort, sortValue);
 
     let html = `<div class="person-filter-row">
         <span class="filter-label">Show:</span>
         ${personFilterChip("all", `All (${searchMatched.length})`)}
         ${personFilterChip("same", `Same person (${samePersonCount})`)}
         ${personFilterChip("different", `Different people (${diffPeopleCount})`)}
+        <span class="filter-label" style="margin-left:10px;">Sort by:</span>
+        ${sortChip("Date", "date", transfersSort, "setTransfersSort")}
+        ${sortChip("Amount", "amount", transfersSort, "setTransfersSort")}
     </div>`;
 
     if (!matched.length && !unmatched.length) {
@@ -3011,8 +3083,8 @@ function renderTransfers(container) {
 
     if (unmatched.length) {
         html += `<div class="panel-title" style="margin-top:24px;">Unmatched movements (needs manual review)</div>`;
-        html += '<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th><th>Amount</th><th>Date</th><th>Address</th><th>TXID</th></tr></thead><tbody>';
-        unmatched.forEach(u => {
+        html += `<div class="table-wrap"><table><thead><tr><th>Direction</th><th>Suspect</th><th>Exchange</th>${sortableTh("Amount", "amount", transfersSort, "setTransfersSort")}${sortableTh("Date", "date", transfersSort, "setTransfersSort")}<th>Address</th><th>TXID</th></tr></thead><tbody>`;
+        unmatchedSorted.forEach(u => {
             html += `<tr>
                 <td><span class="badge ${u.direction}">${TYPE_LABELS[u.direction] || u.direction}</span></td>
                 <td>${escapeHtml(u.suspect_name)}</td>
