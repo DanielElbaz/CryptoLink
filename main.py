@@ -1801,7 +1801,6 @@ HTML_PAGE = """
         margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
     }
     .graph-toggle { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; cursor: pointer; }
-    .graph-export-actions { display: flex; gap: 8px; flex-shrink: 0; }
     .graph-legend { display: flex; gap: 14px; flex-wrap: wrap; }
     .legend-item { font-size: 11.5px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -3229,10 +3228,6 @@ function loadGraph(container) {
                 <label class="graph-toggle"><input type="checkbox" id="graphFilterSame" ${graphColorFilters.same ? "checked" : ""} onchange="setGraphColorFilter('same', this.checked)"> <span class="legend-dot" style="background:#f5a623;"></span> Wallet shared by the same person</label>
                 <span class="legend-item"><span class="legend-dot" style="background:#3ecf8e;"></span> Confirmed TXID transfer (direct link)</span>
             </div>
-            <div class="graph-export-actions">
-                <button class="btn small" onclick="copyGraphImage()">📋 Copy graph</button>
-                <button class="btn small" onclick="exportGraphPng()">💾 Save as PNG</button>
-            </div>
         </div>
         <div class="graph-canvas-wrap">
             <div id="graphCanvas"></div>
@@ -3432,43 +3427,6 @@ function showGraphEdgeDetail(edge) {
 function hideGraphEdgeDetail() {
     const panel = document.getElementById("graphEdgeDetail");
     if (panel) panel.style.display = "none";
-}
-
-// Frames the whole graph right before capturing (so the exported/copied image isn't cropped
-// to whatever the user happened to be zoomed/panned to), then puts their view back exactly
-// where it was. fit() redraws on the next animation frame, not immediately, so the callback
-// has to wait for that frame before reading the canvas - otherwise it'd capture the view
-// from just before the fit.
-function withFullGraphView(callback) {
-    if (!graphNetworkInstance) { showToast("No graph to export yet", true); return; }
-    const savedPosition = graphNetworkInstance.getViewPosition();
-    const savedScale = graphNetworkInstance.getScale();
-    graphNetworkInstance.fit({ animation: false });
-    requestAnimationFrame(() => {
-        callback(graphNetworkInstance.canvas.frame.canvas);
-        graphNetworkInstance.moveTo({ position: savedPosition, scale: savedScale, animation: false });
-    });
-}
-
-function exportGraphPng() {
-    withFullGraphView(canvas => {
-        const link = document.createElement("a");
-        link.download = "cryptolink_graph.png";
-        link.href = canvas.toDataURL("image/png");
-        link.click();
-    });
-}
-
-function copyGraphImage() {
-    withFullGraphView(canvas => {
-        canvas.toBlob(blob => {
-            if (!blob) { showToast("Couldn't create an image of the graph", true); return; }
-            navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
-                () => showToast("Graph copied to clipboard", false),
-                () => showToast("Couldn't copy to clipboard - your browser may not support this", true)
-            );
-        });
-    });
 }
 
 // Graph tab has no per-row list to filter, so the shared search box instead selects and
