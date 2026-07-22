@@ -9,6 +9,7 @@ import pandas as pd
 import uuid
 import io
 import os
+import re
 import sys
 import json
 import time
@@ -70,6 +71,11 @@ EXCLUDED_ADDRESSES = {}
 # via subpoena" or "known legit exchange wallet, not suspicious". Purely informational -
 # doesn't affect matching, filtering, or the graph.
 ADDRESS_NOTES = {}
+
+# Free-text label for the investigation currently open, e.g. "Case 2026-03 - Maharan".
+# Purely a display/filename convenience - shown in the header and used as the export
+# filename, carried over by Save/Load case, reset to "" by Clean all.
+CASE_NAME = ""
 
 # lower(address) -> {"address": original-case address, "sightings": [{suspect_name,
 # case_label, exchanges, occurrence_count, first_seen, last_seen, added_at}, ...]}.
@@ -1480,6 +1486,7 @@ def _build_case_dict():
     return {
         "cryptolink_case_version": CASE_FORMAT_VERSION,
         "saved_at": datetime.now().isoformat(),
+        "case_name": CASE_NAME,
         "suspects": SUSPECTS,
         "excluded_addresses": EXCLUDED_ADDRESSES,
         "address_notes": ADDRESS_NOTES,
@@ -1506,6 +1513,7 @@ def _apply_case_dict(case):
 
     # Loading a case replaces the current session entirely - a case file is a full snapshot,
     # not something to merge with whatever's already open.
+    global CASE_NAME
     SUSPECTS.clear()
     SUSPECTS.update(case["suspects"])
     CATALOG.clear()
@@ -1514,6 +1522,7 @@ def _apply_case_dict(case):
     EXCLUDED_ADDRESSES.update(case.get("excluded_addresses", {}))
     ADDRESS_NOTES.clear()
     ADDRESS_NOTES.update(case.get("address_notes", {}))
+    CASE_NAME = case.get("case_name", "") or ""
 
 
 @app.route("/case/export")
@@ -1521,8 +1530,42 @@ def export_case():
     case = _build_case_dict()
     buf = io.BytesIO(json.dumps(case, ensure_ascii=False, indent=2).encode("utf-8"))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return send_file(buf, as_attachment=True, download_name=f"cryptolink_case_{stamp}.json",
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", CASE_NAME).strip("_")
+    prefix = f"cryptolink_{safe_name}" if safe_name else "cryptolink_case"
+    return send_file(buf, as_attachment=True, download_name=f"{prefix}_{stamp}.json",
                       mimetype="application/json")
+
+
+@app.route("/case/name", methods=["GET"])
+def get_case_name():
+    return jsonify({"name": CASE_NAME})
+
+
+@app.route("/case/name", methods=["POST"])
+def set_case_name():
+    global CASE_NAME
+    data = request.get_json() or {}
+    CASE_NAME = (data.get("name") or "").strip()
+    return jsonify({"success": True, "name": CASE_NAME})
+
+
+@app.route("/case/reset", methods=["POST"])
+def reset_case():
+    """Clean all: wipes the current investigation (suspects, files, hidden wallets, notes,
+    case name) so a new one can start fresh. The persistent cross-case known-wallets ledger
+    is untouched - that one is explicitly meant to survive this."""
+    global CASE_NAME
+    SUSPECTS.clear()
+    CATALOG.clear()
+    EXCLUDED_ADDRESSES.clear()
+    ADDRESS_NOTES.clear()
+    CASE_NAME = ""
+    if os.path.exists(AUTOSAVE_PATH):
+        try:
+            os.remove(AUTOSAVE_PATH)
+        except Exception:
+            traceback.print_exc()
+    return jsonify({"success": True})
 
 
 @app.route("/case/import", methods=["POST"])
@@ -1550,6 +1593,7 @@ def import_case():
         "suspect_count": len(SUSPECTS),
         "file_count": len(CATALOG),
         "saved_at": case.get("saved_at"),
+        "case_name": case.get("case_name", ""),
     })
 
 
@@ -1615,6 +1659,7 @@ def restore_autosave():
         "suspect_count": len(SUSPECTS),
         "file_count": len(CATALOG),
         "saved_at": case.get("saved_at"),
+        "case_name": case.get("case_name", ""),
     })
 
 
@@ -1727,6 +1772,18 @@ HTML_PAGE = """
     header p { color: var(--text-dim); margin: 0; font-size: 14px; }
     .header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
     .case-actions { display: flex; gap: 8px; flex-shrink: 0; }
+    .case-name-row { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; }
+    .case-name-badge {
+        display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-dim);
+        background: var(--bg-card); border: 1px solid var(--border); border-radius: 999px;
+        padding: 3px 12px; cursor: pointer;
+    }
+    .case-name-badge:hover { color: var(--text); border-color: var(--accent-dim); }
+    .case-name-badge.untitled { font-style: italic; }
+    .case-name-input {
+        font-size: 13px; background: var(--input-bg); color: var(--text); border: 1px solid var(--accent);
+        border-radius: 999px; padding: 3px 12px; width: 220px;
+    }
     .autosave-banner {
         display: flex; align-items: center; justify-content: space-between; gap: 12px;
         background: rgba(79,140,255,0.1); border: 1px solid var(--accent-dim); border-radius: var(--radius);
@@ -2016,6 +2073,12 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
         <div class="header-row">
             <div>
                 <h1>CryptoLink</h1>
+                <div class="case-name-row">
+                    <span class="case-name-badge untitled" id="caseNameDisplay" onclick="startEditCaseName()" title="Click to name this case">📁 Untitled case ✏️</span>
+                    <input type="text" class="case-name-input" id="caseNameInput" style="display:none;"
+                           placeholder="Case name..." maxlength="120"
+                           onblur="saveCaseName()" onkeydown="onCaseNameKeydown(event)">
+                </div>
                 <p>Import Excel files received from exchanges. Only Deposit/Withdrawal sheets are kept.</p>
             </div>
             <div class="case-actions">
@@ -2023,6 +2086,7 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                 <button class="btn small" onclick="saveCase()">💾 Save case</button>
                 <button class="btn small" onclick="document.getElementById('caseFileInput').click()">📂 Load case</button>
                 <input type="file" id="caseFileInput" accept=".json" style="display:none;" onchange="loadCase(this.files[0])">
+                <button class="btn small" id="cleanAllBtn" onclick="cleanAll()" title="Reset the current case (known wallets database is kept)">🧹 Clean all</button>
             </div>
         </div>
     </header>
@@ -2130,6 +2194,7 @@ let catalogData = {};    // file id -> entry
 let activeSuspectId = "";
 let collapsedSuspects = {};
 let editingSuspectNote = null;  // suspect id currently showing its note editor, or null
+let currentCaseName = "";
 
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
@@ -2491,7 +2556,7 @@ function fmtUsd(amountUsd) {
 }
 function fmtDate(iso) {
     if (!iso) return "-";
-    return new Date(iso).toLocaleString();
+    return new Date(iso).toLocaleString(undefined, { hour12: false });
 }
 
 // Truncated mono value (address or TXID) with a hover-reveal copy icon that always copies
@@ -3261,6 +3326,7 @@ function loadCase(file) {
             collapsedSuspects = {};
             catalogData = {};
             suspectFilterSelected = new Set();
+            renderCaseName(data.case_name);
 
             fetch("/files").then(r => r.json()).then(files => {
                 files.forEach(item => { catalogData[item.id] = item; });
@@ -3276,11 +3342,71 @@ function loadCase(file) {
 }
 
 
+// ---------------------------------------------------------------------------
+// CASE NAME
+// ---------------------------------------------------------------------------
+
+function renderCaseName(name) {
+    currentCaseName = name || "";
+    const badge = document.getElementById("caseNameDisplay");
+    if (currentCaseName) {
+        badge.textContent = "📁 " + currentCaseName + " ✏️";
+        badge.classList.remove("untitled");
+    } else {
+        badge.textContent = "📁 Untitled case ✏️";
+        badge.classList.add("untitled");
+    }
+}
+
+function startEditCaseName() {
+    const input = document.getElementById("caseNameInput");
+    document.getElementById("caseNameDisplay").style.display = "none";
+    input.style.display = "inline-block";
+    input.value = currentCaseName;
+    input.focus();
+    input.select();
+}
+
+function onCaseNameKeydown(event) {
+    if (event.key === "Enter") { event.target.blur(); }
+    else if (event.key === "Escape") { event.target.value = currentCaseName; event.target.blur(); }
+}
+
+function saveCaseName() {
+    const input = document.getElementById("caseNameInput");
+    const name = input.value.trim();
+    input.style.display = "none";
+    document.getElementById("caseNameDisplay").style.display = "inline-flex";
+    if (name === currentCaseName) return;
+    fetch("/case/name", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) })
+        .then(r => r.json()).then(data => renderCaseName(data.name))
+        .catch(err => showToast("Network error saving case name: " + err, true));
+}
+
+function cleanAll() {
+    if (!confirm("Clean all wipes the current case (suspects, files, hidden wallets, notes, case name). The known-wallets database is kept. Continue?")) return;
+    fetch("/case/reset", { method: "POST" })
+        .then(r => r.json())
+        .then(() => {
+            activeSuspectId = "";
+            collapsedSuspects = {};
+            catalogData = {};
+            suspectFilterSelected = new Set();
+            renderCaseName("");
+            dismissAutosaveBanner();
+            refreshSuspects();
+            updateDropzoneState();
+            showToast("Case cleared.", false);
+        })
+        .catch(err => showToast("Network error clearing case: " + err, true));
+}
+
 // All state lives server-side (SUSPECTS/CATALOG in memory) - a page refresh doesn't lose
 // anything on the server, but catalogData is a client-side JS object that starts empty on
 // every page load, so without this the Files tab would show "No files imported yet." right
 // after a refresh even though the server still has everything.
 function initApp() {
+    fetch("/case/name").then(r => r.json()).then(data => renderCaseName(data.name));
     fetch("/files").then(r => r.json()).then(files => {
         files.forEach(item => { catalogData[item.id] = item; });
         refreshSuspects();
@@ -3293,7 +3419,7 @@ function initApp() {
 function checkAutosaveBanner() {
     fetch("/case/autosave/status").then(r => r.json()).then(status => {
         if (!status.exists) return;
-        const when = status.saved_at ? new Date(status.saved_at).toLocaleString() : "an earlier session";
+        const when = status.saved_at ? new Date(status.saved_at).toLocaleString(undefined, { hour12: false }) : "an earlier session";
         const banner = document.getElementById("autosaveBanner");
         banner.innerHTML = `
             <span>💾 Found an autosave from ${escapeHtml(when)} - looks like the app didn't close cleanly last time.</span>
@@ -3320,6 +3446,7 @@ function restoreAutosave() {
             collapsedSuspects = {};
             catalogData = {};
             suspectFilterSelected = new Set();
+            renderCaseName(data.case_name);
             fetch("/files").then(r => r.json()).then(files => {
                 files.forEach(item => { catalogData[item.id] = item; });
                 refreshSuspects();
