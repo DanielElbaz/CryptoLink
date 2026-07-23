@@ -1646,11 +1646,10 @@ HTML_PAGE = """
         #activeSuspectSelect { min-width: 0; }
     }
 
-    .main-tabs, .sub-tabs {
+    .main-tabs {
         display: flex; gap: 6px; margin-bottom: 20px; border-bottom: 1px solid var(--border);
         padding-bottom: 0;
     }
-    .sub-tabs { margin-bottom: 16px; }
     .tab-btn {
         background: none; border: none; color: var(--text-dim); font-size: 14px;
         padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent;
@@ -1658,7 +1657,20 @@ HTML_PAGE = """
     }
     .tab-btn:hover { color: var(--text); }
     .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
-    .sub-tabs .tab-btn { font-size: 13px; padding: 8px 12px; }
+
+    .sub-tabs {
+        display: flex; gap: 4px; margin-bottom: 18px;
+        background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 5px;
+    }
+    .sub-tabs .tab-btn {
+        flex: 1; text-align: center; font-size: 13.5px; font-weight: 500; padding: 11px 14px;
+        border-bottom: none; border-radius: 7px; margin-bottom: 0; white-space: nowrap;
+    }
+    .sub-tabs .tab-btn:hover { color: var(--text); background: var(--hover-bg); }
+    .sub-tabs .tab-btn.active {
+        color: var(--btn-text); background: var(--accent-dim); border-bottom: none; font-weight: 600;
+    }
 
     .analysis-loading { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
     .analysis-empty { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
