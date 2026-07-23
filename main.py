@@ -511,6 +511,10 @@ def get_all_transactions(suspect_ids=None):
     return rows
 
 
+def _address_note(address):
+    return ADDRESS_NOTES.get((address or "").lower(), {}).get("note", "")
+
+
 def compute_addresses_analysis(suspect_ids=None):
     """Dominant wallets + addresses shared across different suspect/exchange combos."""
     rows = [r for r in get_all_transactions(suspect_ids)
@@ -528,7 +532,7 @@ def compute_addresses_analysis(suspect_ids=None):
         distinct_suspects = {o["suspect_id"] for o in occurrences}
         results.append({
             "address": occurrences[0]["external_address"],
-            "note": ADDRESS_NOTES.get(addr_lower, {}).get("note", ""),
+            "note": _address_note(addr_lower),
             # Sightings of this address from previously committed cases (see
             # /known_wallets/commit) - a wallet with almost no data in the current case can
             # still surface a match against everything ever investigated before.
@@ -555,6 +559,7 @@ def compute_addresses_analysis(suspect_ids=None):
                 "txid": o["txid"], "exchange_address": o["exchange_address"],
                 "exchange_address_category": KNOWN_WALLETS.get((o["exchange_address"] or "").lower(), {}).get("category", ""),
                 "exchange_address_category_color": KNOWN_WALLETS.get((o["exchange_address"] or "").lower(), {}).get("category_color", ""),
+                "exchange_address_note": _address_note(o["exchange_address"]),
             } for o in occurrences],
         })
 
@@ -591,7 +596,7 @@ def list_excluded_addresses():
             "address": original,
             "occurrence_count": len(occurrences),
             "suspect_names": sorted({o["suspect_name"] for o in occurrences}),
-            "note": ADDRESS_NOTES.get(addr_lower, {}).get("note", ""),
+            "note": _address_note(addr_lower),
         })
     result.sort(key=lambda x: x["address"].lower())
     return jsonify(result)
@@ -641,6 +646,10 @@ def compute_amounts_analysis(suspect_ids=None):
         "category_color": _cat(r["external_address"]).get("category_color", ""),
         "exchange_address_category": _cat(r["exchange_address"]).get("category", ""),
         "exchange_address_category_color": _cat(r["exchange_address"]).get("category_color", ""),
+        # Same free-text note lookup used by compute_addresses_analysis - a note set from any
+        # tab shows up here too.
+        "note": _address_note(r["external_address"]),
+        "exchange_address_note": _address_note(r["exchange_address"]),
     } for r in rows]
 
 
@@ -660,6 +669,8 @@ def _transfer_side(o):
         "category": known.get("category", ""), "category_color": known.get("category_color", ""),
         "exchange_address_category": exchange_known.get("category", ""),
         "exchange_address_category_color": exchange_known.get("category_color", ""),
+        "note": _address_note(o["external_address"]),
+        "exchange_address_note": _address_note(o["exchange_address"]),
     }
 
 
@@ -1721,6 +1732,29 @@ HTML_PAGE = """
         cursor: pointer; padding: 0; flex-shrink: 0;
     }
     .tag-preset-swatch:hover { border-color: var(--text); transform: scale(1.12); }
+    .note-badge {
+        display: inline-block; max-width: 220px; padding: 3px 9px; border-radius: 20px; font-size: 11px;
+        font-weight: 600; color: var(--text); background: var(--nested-bg); border: 1px solid var(--border);
+        margin-left: 8px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        vertical-align: middle;
+    }
+    .note-badge:hover { border-color: var(--accent-dim); }
+    .note-badge-placeholder {
+        display: inline-block; font-size: 11px; color: var(--text-dim); margin-left: 8px;
+        cursor: pointer; border: 1px dashed var(--border); border-radius: 20px; padding: 2px 8px;
+    }
+    .note-badge-placeholder:hover { color: var(--text); border-color: var(--accent-dim); }
+    .note-popover {
+        position: fixed; z-index: 60; background: var(--bg-card); border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); width: 300px;
+        max-width: calc(100vw - 24px);
+    }
+    .note-popover textarea {
+        width: 100%; min-height: 80px; background: var(--input-bg); color: var(--text);
+        border: 1px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12.5px;
+        font-family: inherit; resize: vertical; cursor: text;
+    }
+    .note-popover-actions { display: flex; gap: 8px; margin-top: 8px; }
     #knownWalletsPanel { max-width: 560px; }
     .category-popover {
         position: fixed; z-index: 60; background: var(--bg-card); border: 1px solid var(--border);
@@ -2107,6 +2141,15 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
         <button class="btn small" onclick="saveCategoryPopover()">Save</button>
         <button class="btn small" id="categoryPopoverRemoveBtn" onclick="removeCategoryPopover()" style="display:none;">Remove</button>
         <button class="btn small" onclick="closeCategoryPopover()">Cancel</button>
+    </div>
+</div>
+
+<div id="notePopover" class="note-popover" style="display:none;" onclick="event.stopPropagation()">
+    <textarea id="notePopoverInput" placeholder="Add a note about this wallet..." maxlength="2000"></textarea>
+    <div class="note-popover-actions">
+        <button class="btn small" onclick="saveNotePopover()">Save</button>
+        <button class="btn small" id="notePopoverRemoveBtn" onclick="removeNotePopover()" style="display:none;">Remove</button>
+        <button class="btn small" onclick="closeNotePopover()">Cancel</button>
     </div>
 </div>
 
@@ -2548,19 +2591,19 @@ function renderAddresses(container) {
         const isExpanded = !!analysisSearchQuery || expandedAddresses.has(item.address);
         const sightings = item.known_sightings || [];
         html += `<tr class="addr-row" onclick="toggleAddrDetail('${esc}', ${idx})">
-            <td>${addressCellHtml(item.address)}${item.note ? ' <span title="Has a note" style="cursor:help;">📝</span>' : ""}</td>
+            <td>${addressCellHtml(item.address)}</td>
             <td>${item.occurrence_count}</td>
             <td>${item.distinct_accounts}</td>
             <td>
                 ${item.is_cross_suspect ? '<span class="cross-badge">DIFFERENT PEOPLE</span>' : (item.is_cross_account ? '<span class="same-person-badge">SAME PERSON · MULTIPLE EXCHANGES</span>' : "")}
                 ${sightings.length ? `<span class="known-elsewhere-badge" onclick="event.stopPropagation(); toggleAddrDetail('${esc}', ${idx})">👁 SEEN ELSEWHERE (${sightings.length})</span>` : ""}
                 ${categoryBadgeHtml(item.address, item.category, item.category_color)}
+                ${noteBadgeHtml(item.address, item.note)}
             </td>
         </tr>
         <tr class="addr-detail-row" id="addrDetail${idx}" style="display:${isExpanded ? 'table-row' : 'none'};">
             <td colspan="4">
                 <div class="addr-detail-wrap">
-                    ${addressNoteHtml(item)}
                     ${sightings.length ? `<div class="known-sightings-box">
                         <div class="known-sightings-title">👁 Seen in ${sightings.length} previous investigation(s)</div>
                         <table><thead><tr><th>Case</th><th>Suspect</th><th>Exchange(s)</th><th>Occurrences</th><th>Last seen</th></tr></thead><tbody>
@@ -2580,7 +2623,7 @@ function renderAddresses(container) {
                         <td><span class="badge ${o.file_type}">${TYPE_LABELS[o.file_type] || o.file_type}</span></td>
                         <td>${fmtAmount(o.amount, o.currency)}${o.amount_usd ? ' <span style="color:var(--text-dim);font-size:11px;">(' + fmtUsd(o.amount_usd) + ')</span>' : ""}</td>
                         <td>${fmtDate(o.date)}</td>
-                        <td>${o.exchange_address ? truncMono(o.exchange_address) + " " + categoryBadgeHtml(o.exchange_address, o.exchange_address_category, o.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</td>
+                        <td>${o.exchange_address ? truncMono(o.exchange_address) + " " + categoryBadgeHtml(o.exchange_address, o.exchange_address_category, o.exchange_address_category_color) + noteBadgeHtml(o.exchange_address, o.exchange_address_note) : '<span style="color:var(--text-dim);">-</span>'}</td>
                         <td class="addr-mono">${highlightMatch(o.txid || "-")}</td>
                     </tr>`).join("")}
                     </tbody></table>
@@ -2615,51 +2658,6 @@ function addressCellHtml(address, includeHide) {
             <button class="icon-btn" title="Copy address" onclick="event.stopPropagation(); copyAddress('${esc}')">📋</button>
             ${includeHide ? `<button class="icon-btn danger" title="Hide this wallet" onclick="event.stopPropagation(); hideWallet('${esc}')">🗑️</button>` : ""}
         </span>`;
-}
-
-// Free-text note attached to a wallet address (e.g. "known legit exchange wallet, not
-// suspicious"). Lives inside the address's expandable detail row - click-to-edit, no popup.
-let editingAddressNote = null;  // address currently showing its note editor, or null
-
-function addressNoteHtml(item) {
-    const esc = escapeHtml(item.address).replace(/'/g, "\\'");
-    if (editingAddressNote === item.address) {
-        return `<div class="suspect-note" onclick="event.stopPropagation()" style="padding:0 0 12px;">
-            <textarea id="addrNoteInput" placeholder="Add a note about this wallet...">${escapeHtml(item.note || "")}</textarea>
-            <div class="note-actions">
-                <button class="btn small" onclick="event.stopPropagation(); saveAddressNote('${esc}')">Save</button>
-                <button class="btn small" onclick="event.stopPropagation(); cancelAddressNoteEdit()">Cancel</button>
-            </div>
-        </div>`;
-    }
-    return `<div class="suspect-note" onclick="event.stopPropagation(); startAddressNoteEdit('${esc}')" style="padding:0 0 12px;">
-        ${item.note ? `📝 ${escapeHtml(item.note)}` : '<span class="note-placeholder">+ Add note</span>'}
-    </div>`;
-}
-
-function startAddressNoteEdit(address) {
-    editingAddressNote = address;
-    expandedAddresses.add(address);
-    renderAddresses(document.getElementById("analysisContent"));
-    const ta = document.getElementById("addrNoteInput");
-    if (ta) ta.focus();
-}
-
-function cancelAddressNoteEdit() {
-    editingAddressNote = null;
-    renderAddresses(document.getElementById("analysisContent"));
-}
-
-function saveAddressNote(address) {
-    const note = document.getElementById("addrNoteInput").value.trim();
-    fetch("/addresses/note", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address, note })
-    }).then(() => {
-        editingAddressNote = null;
-        loadAddresses(document.getElementById("analysisContent"));
-        refreshHiddenWalletsSidebar();
-    });
 }
 
 // Category badge/placeholder, usable anywhere a wallet address shows up (Wallets, Amounts,
@@ -2708,10 +2706,11 @@ function closeCategoryPopover() {
     categoryPopoverAddress = null;
 }
 
-// Category data lives inside whatever's already cached per tab (cachedAmounts, cachedTransfers,
-// etc.) - after an edit, the simplest correct thing is to drop all of it and let the current
-// tab re-fetch, rather than trying to patch the same address into every possibly-stale array.
-function refreshAllCachedCategoryViews() {
+// Category/note data lives inside whatever's already cached per tab (cachedAmounts,
+// cachedTransfers, etc.) - after an edit, the simplest correct thing is to drop all of it and
+// let the current tab re-fetch, rather than trying to patch the same address into every
+// possibly-stale array.
+function refreshAllCachedAnalysisViews() {
     cachedAddresses = null; cachedAmounts = null; cachedTransfers = null; cachedChains = null;
     loadAnalysisTab(currentAnalysisTab);
 }
@@ -2725,7 +2724,7 @@ function saveCategoryPopover() {
         body: JSON.stringify({ address, category, color })
     }).then(() => {
         closeCategoryPopover();
-        refreshAllCachedCategoryViews();
+        refreshAllCachedAnalysisViews();
         showToast("Category saved", false);
     }).catch(err => showToast("Network error saving category: " + err, true));
 }
@@ -2737,13 +2736,87 @@ function removeCategoryPopover() {
         body: JSON.stringify({ address, category: "", color: "" })
     }).then(() => {
         closeCategoryPopover();
-        refreshAllCachedCategoryViews();
+        refreshAllCachedAnalysisViews();
     }).catch(err => showToast("Network error removing category: " + err, true));
 }
 
 document.addEventListener("click", (e) => {
     const popover = document.getElementById("categoryPopover");
     if (popover && popover.style.display !== "none" && !popover.contains(e.target)) closeCategoryPopover();
+});
+
+// Free-text note badge/placeholder, usable anywhere a wallet address shows up (Wallets,
+// Amounts, Transfers, Chains) - same shared popover everywhere, mirroring categoryBadgeHtml/
+// categoryPopover above, so editing a note from any tab keeps every other view in sync.
+function noteBadgeHtml(address, note) {
+    if (!address) return "";
+    const escAddr = escapeHtml(address);
+    if (note) {
+        const preview = note.length > 40 ? note.slice(0, 40) + "…" : note;
+        return `<span class="note-badge"
+            data-address="${escAddr}" data-note="${escapeHtml(note)}"
+            onclick="event.stopPropagation(); openNotePopoverFromEl(this)" title="${escapeHtml(note)}">📝 ${escapeHtml(preview)}</span>`;
+    }
+    return `<span class="note-badge-placeholder"
+        data-address="${escAddr}" data-note=""
+        onclick="event.stopPropagation(); openNotePopoverFromEl(this)">+ Note</span>`;
+}
+
+function openNotePopoverFromEl(el) {
+    openNotePopover(el.dataset.address, el.dataset.note, el);
+}
+
+let notePopoverAddress = null;
+
+function openNotePopover(address, note, anchorEl) {
+    notePopoverAddress = address;
+    const popover = document.getElementById("notePopover");
+    document.getElementById("notePopoverInput").value = note || "";
+    document.getElementById("notePopoverRemoveBtn").style.display = note ? "inline-block" : "none";
+
+    const rect = anchorEl.getBoundingClientRect();
+    popover.style.display = "block";
+    const left = Math.min(rect.left, window.innerWidth - popover.offsetWidth - 12);
+    const top = Math.min(rect.bottom + 6, window.innerHeight - popover.offsetHeight - 12);
+    popover.style.left = Math.max(12, left) + "px";
+    popover.style.top = Math.max(12, top) + "px";
+
+    document.getElementById("notePopoverInput").focus();
+}
+
+function closeNotePopover() {
+    document.getElementById("notePopover").style.display = "none";
+    notePopoverAddress = null;
+}
+
+function saveNotePopover() {
+    const address = notePopoverAddress;
+    const note = document.getElementById("notePopoverInput").value.trim();
+    fetch("/addresses/note", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, note })
+    }).then(() => {
+        closeNotePopover();
+        refreshAllCachedAnalysisViews();
+        refreshHiddenWalletsSidebar();
+    }).catch(err => showToast("Network error saving note: " + err, true));
+}
+
+function removeNotePopover() {
+    const address = notePopoverAddress;
+    fetch("/addresses/note", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, note: "" })
+    }).then(() => {
+        closeNotePopover();
+        refreshAllCachedAnalysisViews();
+        refreshHiddenWalletsSidebar();
+    }).catch(err => showToast("Network error removing note: " + err, true));
+}
+
+document.addEventListener("click", (e) => {
+    const popover = document.getElementById("notePopover");
+    if (popover && popover.style.display !== "none" && !popover.contains(e.target)) closeNotePopover();
 });
 
 // Search box shared by Wallets/Amounts/Transfers (Graph handles it separately by
@@ -3187,9 +3260,9 @@ function renderAmounts(container) {
             <td>${fmtAmount(r.amount, r.currency)}${r.amount_usd ? ' <span style="color:var(--text-dim);font-size:11.5px;">(' + fmtUsd(r.amount_usd) + ')</span>' : ""}</td>
             <td>${fmtDate(r.date)}</td>
             <td>
-                <div class="flow-line"><span class="flow-tag">${addrLabel}</span> ${truncMono(r.external_address)} ${categoryBadgeHtml(r.external_address, r.category, r.category_color)}</div>
+                <div class="flow-line"><span class="flow-tag">${addrLabel}</span> ${truncMono(r.external_address)} ${categoryBadgeHtml(r.external_address, r.category, r.category_color)}${noteBadgeHtml(r.external_address, r.note)}</div>
                 <div class="flow-arrow">⇄</div>
-                <div class="flow-line"><span class="flow-tag">${exAddrLabel}</span> ${r.exchange_address ? truncMono(r.exchange_address) + " " + categoryBadgeHtml(r.exchange_address, r.exchange_address_category, r.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</div>
+                <div class="flow-line"><span class="flow-tag">${exAddrLabel}</span> ${r.exchange_address ? truncMono(r.exchange_address) + " " + categoryBadgeHtml(r.exchange_address, r.exchange_address_category, r.exchange_address_category_color) + noteBadgeHtml(r.exchange_address, r.exchange_address_note) : '<span style="color:var(--text-dim);">-</span>'}</div>
             </td>
             <td>${truncMono(r.txid)}</td>
         </tr>`;
@@ -3236,8 +3309,8 @@ function transferCardHtml(p) {
                 <div class="amount">${fmtAmount(w.amount, w.currency)}</div>
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(w.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(w.txid || "-")}</span></div>
-                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(w.external_address || "-")}</span> ${categoryBadgeHtml(w.external_address, w.category, w.category_color)}</div>
-                ${w.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(w.exchange_address)}</span> ${categoryBadgeHtml(w.exchange_address, w.exchange_address_category, w.exchange_address_category_color)}</div>` : ""}
+                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(w.external_address || "-")}</span> ${categoryBadgeHtml(w.external_address, w.category, w.category_color)}${noteBadgeHtml(w.external_address, w.note)}</div>
+                ${w.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(w.exchange_address)}</span> ${categoryBadgeHtml(w.exchange_address, w.exchange_address_category, w.exchange_address_category_color)}${noteBadgeHtml(w.exchange_address, w.exchange_address_note)}</div>` : ""}
             </div>
             <div class="transfer-arrow">→</div>
             <div class="transfer-side">
@@ -3247,8 +3320,8 @@ function transferCardHtml(p) {
                 <div class="amount">${fmtAmount(d.amount, d.currency)}</div>
                 <div style="color:var(--text-dim);font-size:12px;">${fmtDate(d.date)}</div>
                 <div class="txid-line">TX Hash: <span class="addr-mono">${highlightMatch(d.txid || "-")}</span></div>
-                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(d.external_address || "-")}</span> ${categoryBadgeHtml(d.external_address, d.category, d.category_color)}</div>
-                ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span> ${categoryBadgeHtml(d.exchange_address, d.exchange_address_category, d.exchange_address_category_color)}</div>` : ""}
+                <div class="txid-line">Address: <span class="addr-mono">${highlightMatch(d.external_address || "-")}</span> ${categoryBadgeHtml(d.external_address, d.category, d.category_color)}${noteBadgeHtml(d.external_address, d.note)}</div>
+                ${d.exchange_address ? `<div class="txid-line">Exchange address: <span class="addr-mono">${highlightMatch(d.exchange_address)}</span> ${categoryBadgeHtml(d.exchange_address, d.exchange_address_category, d.exchange_address_category_color)}${noteBadgeHtml(d.exchange_address, d.exchange_address_note)}</div>` : ""}
             </div>
         </div>
         <div class="transfer-gap">
@@ -3409,8 +3482,8 @@ function renderTransfers(container) {
                 <td>${escapeHtml(u.exchange)}</td>
                 <td>${fmtAmount(u.amount, u.currency)}</td>
                 <td>${fmtDate(u.date)}</td>
-                <td>${truncMono(u.address)} ${categoryBadgeHtml(u.address, u.category, u.category_color)}</td>
-                <td>${u.exchange_address ? truncMono(u.exchange_address) + " " + categoryBadgeHtml(u.exchange_address, u.exchange_address_category, u.exchange_address_category_color) : '<span style="color:var(--text-dim);">-</span>'}</td>
+                <td>${truncMono(u.address)} ${categoryBadgeHtml(u.address, u.category, u.category_color)}${noteBadgeHtml(u.address, u.note)}</td>
+                <td>${u.exchange_address ? truncMono(u.exchange_address) + " " + categoryBadgeHtml(u.exchange_address, u.exchange_address_category, u.exchange_address_category_color) + noteBadgeHtml(u.exchange_address, u.exchange_address_note) : '<span style="color:var(--text-dim);">-</span>'}</td>
                 <td>${truncMono(u.txid)}</td>
             </tr>`;
         });
