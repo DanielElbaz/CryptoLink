@@ -1787,10 +1787,47 @@ HTML_PAGE = """
     .filter-panel-row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 10px; }
     .filter-panel-row:last-of-type { margin-bottom: 0; }
     .filter-panel-row label { display: flex; flex-direction: column; align-items: stretch; gap: 4px; font-size: 12.5px; color: var(--text-dim); }
-    .filter-panel-row input[type="date"], .filter-panel-row input[type="text"] {
+    .filter-panel-row input[type="text"] {
         width: 100%; font-size: 12.5px; padding: 5px 8px; background: var(--input-bg); color: var(--text);
         border: 1px solid var(--border); border-radius: 6px;
     }
+    .date-filter-field { position: relative; }
+    .date-filter-field .date-filter-display { cursor: pointer; padding-right: 26px; }
+    .date-filter-field .date-filter-icon {
+        position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+        font-size: 12px; pointer-events: none; opacity: 0.75;
+    }
+
+    .date-picker-popup {
+        position: fixed; z-index: 70; width: 240px; background: var(--bg-card); color: var(--text);
+        border: 1px solid var(--border); border-radius: var(--radius); padding: 10px;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+    }
+    .dp-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .dp-title { font-size: 12.5px; font-weight: 600; }
+    .dp-nav {
+        background: none; border: 1px solid var(--border); color: var(--text); cursor: pointer;
+        width: 24px; height: 24px; border-radius: 6px; line-height: 1; font-size: 13px;
+    }
+    .dp-nav:hover { border-color: var(--accent); color: var(--accent); }
+    .dp-weekdays, .dp-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+    .dp-weekdays span { text-align: center; font-size: 10.5px; color: var(--text-dim); padding: 2px 0; }
+    .dp-day {
+        background: none; border: none; color: var(--text); cursor: pointer; font-size: 12px;
+        padding: 6px 0; border-radius: 6px; text-align: center;
+    }
+    .dp-day:hover { background: var(--hover-bg); }
+    .dp-day.dp-outside { color: var(--text-dim); opacity: 0.5; }
+    .dp-day.dp-today { border: 1px solid var(--accent-dim); }
+    .dp-day.dp-selected { background: var(--accent-dim); color: var(--btn-text); font-weight: 600; }
+    .dp-footer {
+        display: flex; justify-content: space-between; margin-top: 8px; padding-top: 8px;
+        border-top: 1px solid var(--border);
+    }
+    .dp-link {
+        background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 2px 4px;
+    }
+    .dp-link:hover { text-decoration: underline; }
     .filter-exchange-list { display: flex; flex-wrap: wrap; gap: 10px; }
     .filter-exchange-item { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--text-dim); cursor: pointer; }
     .filter-exchange-item input { cursor: pointer; }
@@ -1957,8 +1994,20 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                 <button class="btn small" id="analysisFilterToggleBtn" onclick="toggleAnalysisFilterPanel()" style="width:100%;margin-bottom:10px;">🔎 Filters ▾</button>
                 <div id="analysisFilterPanel" class="analysis-filter-panel" style="display:none;">
                     <div class="filter-panel-row">
-                        <label>From <input type="date" id="filterDateFrom" onchange="onAnalysisFilterChange()"></label>
-                        <label>To <input type="date" id="filterDateTo" onchange="onAnalysisFilterChange()"></label>
+                        <label>From
+                            <div class="date-filter-field">
+                                <input type="text" id="filterDateFromDisplay" class="date-filter-display" placeholder="jj/mm/aaaa" readonly onclick="openDatePicker('filterDateFrom', this)">
+                                <input type="hidden" id="filterDateFrom">
+                                <span class="date-filter-icon">📅</span>
+                            </div>
+                        </label>
+                        <label>To
+                            <div class="date-filter-field">
+                                <input type="text" id="filterDateToDisplay" class="date-filter-display" placeholder="jj/mm/aaaa" readonly onclick="openDatePicker('filterDateTo', this)">
+                                <input type="hidden" id="filterDateTo">
+                                <span class="date-filter-icon">📅</span>
+                            </div>
+                        </label>
                         <label>Address contains <input type="text" id="filterAddress" placeholder="0xabc..." oninput="onAnalysisFilterChange()"></label>
                         <label>TXID contains <input type="text" id="filterTxid" placeholder="abc123..." oninput="onAnalysisFilterChange()"></label>
                     </div>
@@ -1993,6 +2042,22 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
             <button class="modal-close" onclick="closeModal()">&times;</button>
         </div>
         <div class="modal-body" id="modalBody"></div>
+    </div>
+</div>
+
+<div class="date-picker-popup" id="datePickerPopup" style="display:none;">
+    <div class="dp-header">
+        <button type="button" class="dp-nav" onclick="dpChangeMonth(-1)">‹</button>
+        <span class="dp-title" id="dpTitle"></span>
+        <button type="button" class="dp-nav" onclick="dpChangeMonth(1)">›</button>
+    </div>
+    <div class="dp-weekdays">
+        <span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span>
+    </div>
+    <div class="dp-grid" id="dpGrid"></div>
+    <div class="dp-footer">
+        <button type="button" class="dp-link" onclick="dpToday()">Today</button>
+        <button type="button" class="dp-link" onclick="dpClear()">Clear</button>
     </div>
 </div>
 
@@ -2687,6 +2752,121 @@ function onExchangeFilterChange(exchange, checked) {
     applyAnalysisFilterState();
 }
 
+// Custom dd/mm/yyyy calendar popup for the date-range filter fields, replacing the native
+// <input type="date"> whose display format follows the browser locale (often mm/dd/yyyy).
+// Each field is a hidden input (id="filterDateFrom"/"filterDateTo", ISO "YYYY-MM-DD" value,
+// read directly by matchesFilters/onAnalysisFilterChange) paired with a readonly display
+// input showing the formatted date. A single popup instance is reused for both fields.
+let dpField = null, dpDisplayEl = null, dpViewYear = null, dpViewMonth = null;
+
+function fmtDateDMY(iso) {
+    if (!iso) return "";
+    const [y, m, d] = iso.split("-");
+    return `${d}/${m}/${y}`;
+}
+
+function setDateFilterValue(fieldId, iso) {
+    document.getElementById(fieldId).value = iso || "";
+    document.getElementById(fieldId + "Display").value = fmtDateDMY(iso);
+}
+
+function openDatePicker(fieldId, displayEl) {
+    const popup = document.getElementById("datePickerPopup");
+    if (dpField === fieldId && popup.style.display !== "none") {
+        closeDatePicker();
+        return;
+    }
+    dpField = fieldId;
+    dpDisplayEl = displayEl;
+    const iso = document.getElementById(fieldId).value;
+    const base = iso ? new Date(iso + "T00:00:00") : new Date();
+    dpViewYear = base.getFullYear();
+    dpViewMonth = base.getMonth();
+
+    const rect = displayEl.getBoundingClientRect();
+    popup.style.display = "block";
+    popup.style.top = `${rect.bottom + 4}px`;
+    popup.style.left = `${Math.max(8, rect.left)}px`;
+    dpRender();
+
+    document.addEventListener("mousedown", dpOutsideClick, true);
+    document.addEventListener("keydown", dpEscape, true);
+}
+
+function closeDatePicker() {
+    document.getElementById("datePickerPopup").style.display = "none";
+    dpField = null;
+    dpDisplayEl = null;
+    document.removeEventListener("mousedown", dpOutsideClick, true);
+    document.removeEventListener("keydown", dpEscape, true);
+}
+
+function dpOutsideClick(e) {
+    const popup = document.getElementById("datePickerPopup");
+    if (popup.contains(e.target) || e.target === dpDisplayEl) return;
+    closeDatePicker();
+}
+
+function dpEscape(e) {
+    if (e.key === "Escape") closeDatePicker();
+}
+
+function dpChangeMonth(delta) {
+    dpViewMonth += delta;
+    if (dpViewMonth < 0) { dpViewMonth = 11; dpViewYear--; }
+    else if (dpViewMonth > 11) { dpViewMonth = 0; dpViewYear++; }
+    dpRender();
+}
+
+const DP_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
+
+function dpRender() {
+    document.getElementById("dpTitle").textContent = `${DP_MONTH_NAMES[dpViewMonth]} ${dpViewYear}`;
+
+    const selectedIso = dpField ? document.getElementById(dpField).value : "";
+    const todayIso = new Date().toISOString().slice(0, 10);
+
+    const firstOfMonth = new Date(dpViewYear, dpViewMonth, 1);
+    const startOffset = (firstOfMonth.getDay() + 6) % 7; // Monday-first week
+    const gridStart = new Date(dpViewYear, dpViewMonth, 1 - startOffset);
+
+    let html = "";
+    for (let i = 0; i < 42; i++) {
+        const cell = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
+        const cellIso = `${cell.getFullYear()}-${String(cell.getMonth() + 1).padStart(2, "0")}-${String(cell.getDate()).padStart(2, "0")}`;
+        const outside = cell.getMonth() !== dpViewMonth;
+        const cls = ["dp-day"];
+        if (outside) cls.push("dp-outside");
+        if (cellIso === todayIso) cls.push("dp-today");
+        if (cellIso === selectedIso) cls.push("dp-selected");
+        html += `<button type="button" class="${cls.join(" ")}" onclick="dpSelectDay('${cellIso}')">${cell.getDate()}</button>`;
+    }
+    document.getElementById("dpGrid").innerHTML = html;
+}
+
+function dpSelectDay(iso) {
+    if (!dpField) return;
+    setDateFilterValue(dpField, iso);
+    closeDatePicker();
+    onAnalysisFilterChange();
+}
+
+function dpToday() {
+    if (!dpField) return;
+    const iso = new Date().toISOString().slice(0, 10);
+    setDateFilterValue(dpField, iso);
+    closeDatePicker();
+    onAnalysisFilterChange();
+}
+
+function dpClear() {
+    if (!dpField) return;
+    setDateFilterValue(dpField, "");
+    closeDatePicker();
+    onAnalysisFilterChange();
+}
+
 function onAnalysisFilterChange() {
     analysisFilters.dateFrom = document.getElementById("filterDateFrom").value;
     analysisFilters.dateTo = document.getElementById("filterDateTo").value;
@@ -2714,8 +2894,8 @@ function applyAnalysisFilterState() {
 }
 
 function clearAnalysisFilters() {
-    document.getElementById("filterDateFrom").value = "";
-    document.getElementById("filterDateTo").value = "";
+    setDateFilterValue("filterDateFrom", "");
+    setDateFilterValue("filterDateTo", "");
     document.getElementById("filterAddress").value = "";
     document.getElementById("filterTxid").value = "";
     analysisFilters = { dateFrom: "", dateTo: "", address: "", txid: "", exchanges: new Set() };
@@ -3046,8 +3226,8 @@ function viewWalletHistory(address) {
     document.getElementById("analysisSearchClear").style.display = "none";
 
     analysisFilters = { dateFrom: "", dateTo: "", address: address.trim().toLowerCase(), txid: "", exchanges: new Set() };
-    document.getElementById("filterDateFrom").value = "";
-    document.getElementById("filterDateTo").value = "";
+    setDateFilterValue("filterDateFrom", "");
+    setDateFilterValue("filterDateTo", "");
     document.getElementById("filterTxid").value = "";
     document.getElementById("filterAddress").value = address;
     document.getElementById("analysisFilterPanel").style.display = "block";
