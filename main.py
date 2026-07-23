@@ -1646,11 +1646,10 @@ HTML_PAGE = """
         #activeSuspectSelect { min-width: 0; }
     }
 
-    .main-tabs, .sub-tabs {
+    .main-tabs {
         display: flex; gap: 6px; margin-bottom: 20px; border-bottom: 1px solid var(--border);
         padding-bottom: 0;
     }
-    .sub-tabs { margin-bottom: 16px; }
     .tab-btn {
         background: none; border: none; color: var(--text-dim); font-size: 14px;
         padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent;
@@ -1658,7 +1657,20 @@ HTML_PAGE = """
     }
     .tab-btn:hover { color: var(--text); }
     .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
-    .sub-tabs .tab-btn { font-size: 13px; padding: 8px 12px; }
+
+    .sub-tabs {
+        display: flex; gap: 4px; margin-bottom: 18px;
+        background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 5px;
+    }
+    .sub-tabs .tab-btn {
+        flex: 1; text-align: center; font-size: 13.5px; font-weight: 500; padding: 11px 14px;
+        border-bottom: none; border-radius: 7px; margin-bottom: 0; white-space: nowrap;
+    }
+    .sub-tabs .tab-btn:hover { color: var(--text); background: var(--hover-bg); }
+    .sub-tabs .tab-btn.active {
+        color: var(--btn-text); background: var(--accent-dim); border-bottom: none; font-weight: 600;
+    }
 
     .analysis-loading { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
     .analysis-empty { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
@@ -1702,6 +1714,13 @@ HTML_PAGE = """
     .category-edit-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .category-edit-row input[type="text"] { flex: 1 1 120px; min-width: 0; }
     .category-edit-row input[type="color"] { width: 36px; height: 30px; padding: 2px; cursor: pointer; flex-shrink: 0; }
+    .tag-preset-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+    .tag-preset-label { font-size: 11px; color: var(--text-dim); margin-right: 2px; }
+    .tag-preset-swatch {
+        width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border);
+        cursor: pointer; padding: 0; flex-shrink: 0;
+    }
+    .tag-preset-swatch:hover { border-color: var(--text); transform: scale(1.12); }
     #knownWalletsPanel { max-width: 560px; }
     .category-popover {
         position: fixed; z-index: 60; background: var(--bg-card); border: 1px solid var(--border);
@@ -1975,6 +1994,14 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
                     Or tag a single wallet manually - works even for an address with no data in the current case,
                     and adds it to the database right away.
                 </p>
+                <div class="tag-preset-row">
+                    <span class="tag-preset-label">Quick tag:</span>
+                    <button type="button" class="tag-preset-swatch" style="background:#8b5cf6;" title="Matrix" onclick="applyTagPreset('manualWalletCategory','manualWalletColor','Matrix','#8b5cf6')"></button>
+                    <button type="button" class="tag-preset-swatch" style="background:#d4a017;" title="Binance" onclick="applyTagPreset('manualWalletCategory','manualWalletColor','Binance','#d4a017')"></button>
+                    <button type="button" class="tag-preset-swatch" style="background:#22c55e;" title="OKX" onclick="applyTagPreset('manualWalletCategory','manualWalletColor','OKX','#22c55e')"></button>
+                    <button type="button" class="tag-preset-swatch" style="background:#dc2626;" title="RedotPay" onclick="applyTagPreset('manualWalletCategory','manualWalletColor','RedotPay','#dc2626')"></button>
+                    <button type="button" class="tag-preset-swatch" style="background:#3b82f6;" title="Bybit" onclick="applyTagPreset('manualWalletCategory','manualWalletColor','Bybit','#3b82f6')"></button>
+                </div>
                 <div class="category-edit-row" style="margin-bottom:8px;">
                     <input type="text" id="manualWalletAddress" placeholder="Wallet address">
                     <input type="text" id="manualWalletCategory" placeholder="Category, e.g. Mixer">
@@ -2064,6 +2091,14 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
 <div class="toast" id="toast"></div>
 
 <div id="categoryPopover" class="category-popover" style="display:none;" onclick="event.stopPropagation()">
+    <div class="tag-preset-row">
+        <span class="tag-preset-label">Quick tag:</span>
+        <button type="button" class="tag-preset-swatch" style="background:#8b5cf6;" title="Matrix" onclick="applyTagPreset('categoryPopoverInput','categoryPopoverColorInput','Matrix','#8b5cf6')"></button>
+        <button type="button" class="tag-preset-swatch" style="background:#d4a017;" title="Binance" onclick="applyTagPreset('categoryPopoverInput','categoryPopoverColorInput','Binance','#d4a017')"></button>
+        <button type="button" class="tag-preset-swatch" style="background:#22c55e;" title="OKX" onclick="applyTagPreset('categoryPopoverInput','categoryPopoverColorInput','OKX','#22c55e')"></button>
+        <button type="button" class="tag-preset-swatch" style="background:#dc2626;" title="RedotPay" onclick="applyTagPreset('categoryPopoverInput','categoryPopoverColorInput','RedotPay','#dc2626')"></button>
+        <button type="button" class="tag-preset-swatch" style="background:#3b82f6;" title="Bybit" onclick="applyTagPreset('categoryPopoverInput','categoryPopoverColorInput','Bybit','#3b82f6')"></button>
+    </div>
     <div class="category-edit-row">
         <input type="text" id="categoryPopoverInput" placeholder="Category, e.g. Binance hot wallet" maxlength="80">
         <input type="color" id="categoryPopoverColorInput" title="Badge color">
@@ -2078,6 +2113,13 @@ document.documentElement.setAttribute("data-theme", localStorage.getItem("crypto
 <script>
 const EXCHANGES = ["binance", "okx", "bybit", "redotpay", "matrix", "unknown"];
 const TYPE_LABELS = {"deposit": "Deposit", "withdrawal": "Withdrawal"};
+
+// Quick-tag swatches (categoryPopover + the manual wallet form) prefill the category text +
+// color inputs but don't save on their own - free-text/custom color and Save/Remove stay untouched.
+function applyTagPreset(textInputId, colorInputId, name, color) {
+    document.getElementById(textInputId).value = name;
+    document.getElementById(colorInputId).value = color;
+}
 
 let suspects = {};       // id -> name
 let suspectNotes = {};   // id -> note text
